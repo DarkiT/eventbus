@@ -378,3 +378,172 @@ func (m *testMiddleware) Before(topic string, payload any) any {
 func (m *testMiddleware) After(topic string, payload any) {
 	m.afterFunc(topic, payload)
 }
+
+func Test_EventBusTracer(t *testing.T) {
+	bus := New()
+
+	// 创建一个测试追踪器
+	tracer := &mockTracer{}
+	bus.SetTracer(tracer)
+
+	// 测试订阅
+	err := bus.Subscribe("test", func(topic string, msg interface{}) {})
+	assert.Nil(t, err)
+
+	// 测试发布
+	err = bus.Publish("test", "message")
+	assert.Nil(t, err)
+
+	// 测试取消订阅
+	err = bus.Unsubscribe("test", func(topic string, msg interface{}) {})
+	assert.Nil(t, err)
+}
+
+func Test_EventBusFilter(t *testing.T) {
+	bus := New()
+
+	// 添加测试过滤器
+	bus.AddFilter(&mockFilter{allow: false})
+
+	// 测试被过滤的消息
+	err := bus.Publish("test", "message")
+	assert.Nil(t, err)
+}
+
+func Test_EventBusMiddleware(t *testing.T) {
+	bus := New()
+
+	// 添加测试中间件
+	bus.Use(&mockMiddleware{})
+
+	// 测试带中间件的发布
+	err := bus.Publish("test", "message")
+	assert.Nil(t, err)
+}
+
+func Test_EventBusClose(t *testing.T) {
+	bus := New()
+
+	// 订阅一些处理器
+	err := bus.Subscribe("test", func(topic string, msg interface{}) {})
+	assert.Nil(t, err)
+
+	// 发布一些消息
+	err = bus.Publish("test", "message")
+	assert.Nil(t, err)
+
+	// 关闭事件总线
+	bus.Close()
+
+	// 测试关闭后的操作
+	err = bus.Publish("test", "message")
+	assert.Equal(t, ErrChannelClosed, err)
+
+	err = bus.Subscribe("test", func(topic string, msg interface{}) {})
+	assert.Equal(t, ErrChannelClosed, err)
+}
+
+func Test_EventBusHealthCheck(t *testing.T) {
+	bus := New()
+
+	// 测试正常状态
+	err := bus.HealthCheck()
+	assert.Nil(t, err)
+
+	// 关闭事件总线
+	bus.Close()
+
+	// 测试关闭后的状态
+	err = bus.HealthCheck()
+	assert.Equal(t, ErrChannelClosed, err)
+}
+
+// Mock 实现
+type mockTracer struct{}
+
+func (m *mockTracer) OnSubscribe(topic string, handler interface{})                     {}
+func (m *mockTracer) OnUnsubscribe(topic string, handler interface{})                   {}
+func (m *mockTracer) OnPublish(topic string, msg interface{}, metadata PublishMetadata) {}
+func (m *mockTracer) OnError(topic string, err error)                                   {}
+func (m *mockTracer) OnQueueFull(topic string, queueSize int)                           {}
+func (m *mockTracer) OnSlowConsumer(topic string, latency time.Duration)                {}
+func (m *mockTracer) OnComplete(topic string, metadata CompleteMetadata)                {}
+
+type mockFilter struct {
+	allow bool
+}
+
+func (m *mockFilter) Filter(topic string, msg interface{}) bool {
+	return m.allow
+}
+
+type mockMiddleware struct{}
+
+func (m *mockMiddleware) Before(topic string, msg interface{}) interface{} {
+	return msg
+}
+
+func (m *mockMiddleware) After(topic string, msg interface{}) {}
+
+func Test_EventBusQueueFull(t *testing.T) {
+	bus := NewBuffered(1) // 创建一个只有1个缓冲区的事件总线
+	tracer := &mockTracer{}
+	bus.SetTracer(tracer)
+
+	// 订阅一个慢处理器
+	bus.Subscribe("test", func(topic string, msg interface{}) {
+		time.Sleep(100 * time.Millisecond)
+	})
+
+	// 快速发布多个消息以填满队列
+	for i := 0; i < 3; i++ {
+		bus.Publish("test", i)
+	}
+}
+
+func Test_EventBusSlowConsumer(t *testing.T) {
+	bus := New()
+	tracer := &mockTracer{}
+	bus.SetTracer(tracer)
+
+	// 订阅一个慢处理器
+	bus.Subscribe("test", func(topic string, msg interface{}) {
+		time.Sleep(2 * time.Second)
+	})
+
+	// 发布消息
+	bus.Publish("test", "message")
+}
+
+func Test_EventBusWildcardSubscribe(t *testing.T) {
+	bus := New()
+	received := false
+
+	// 使用通配符订阅
+	bus.Subscribe("test.*", func(topic string, msg interface{}) {
+		received = true
+	})
+
+	// 发布到匹配的主题
+	bus.Publish("test.123", "message")
+
+	// 等待消息处理
+	time.Sleep(100 * time.Millisecond)
+	assert.True(t, received)
+}
+
+func Test_EventBusUnsubscribeAll(t *testing.T) {
+	bus := New()
+
+	// 添加多个订阅者
+	bus.Subscribe("test", func(topic string, msg interface{}) {})
+	bus.Subscribe("test", func(topic string, msg interface{}) {})
+
+	// 取消所有订阅
+	err := bus.UnsubscribeAll("test")
+	assert.Nil(t, err)
+
+	// 测试不存在的主题
+	err = bus.UnsubscribeAll("nonexistent")
+	assert.NotNil(t, err)
+}

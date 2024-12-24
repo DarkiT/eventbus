@@ -174,6 +174,8 @@ type EventBus struct {
 	filters     []EventFilter
 	middlewares []Middleware
 	tracer      EventTracer
+	lock        sync.RWMutex
+	closed      bool
 }
 
 // New 创建一个无缓冲的 EventBus
@@ -233,40 +235,28 @@ func (e *EventBus) SubscribeWithPriority(topic string, handler any, priority int
 
 // HealthCheck 健康检查
 func (e *EventBus) HealthCheck() error {
-	var errors []error
-	e.channels.Range(func(key, value interface{}) bool {
-		ch := value.(*channel)
-		if ch.closed {
-			errors = append(errors, fmt.Errorf("channel %v is closed", key))
-		}
-		return true
-	})
-	if len(errors) > 0 {
-		return fmt.Errorf("health check failed: %v", errors)
+	e.lock.RLock()
+	defer e.lock.RUnlock()
+
+	if e.closed {
+		return ErrChannelClosed
 	}
 	return nil
 }
 
 // Close 关闭 eventbus
 func (e *EventBus) Close() {
-	e.once.Do(func() {
-		e.channels.Range(func(key, value interface{}) bool {
-			ch := value.(*channel)
-			// 先停止接收新的消息
-			ch.Lock()
-			ch.closed = true
-			ch.Unlock()
+	e.lock.Lock()
+	defer e.lock.Unlock()
 
-			// 清空现有消息
-			for len(ch.channel) > 0 {
-				<-ch.channel
-			}
+	// 设置关闭标志
+	e.closed = true
 
-			// 关闭channel
-			close(ch.channel)
-			close(ch.stopCh)
-			return true
-		})
+	// 关闭所有通道
+	e.channels.Range(func(key, value interface{}) bool {
+		ch := value.(*channel)
+		ch.close()
+		return true
 	})
 }
 
@@ -303,6 +293,13 @@ func (c *channel) subscribeWithPriority(handler any, priority int) error {
 
 // Subscribe 支持通配符的订阅
 func (e *EventBus) Subscribe(topic string, handler any) error {
+	e.lock.RLock()
+	if e.closed {
+		e.lock.RUnlock()
+		return ErrChannelClosed
+	}
+	e.lock.RUnlock()
+
 	if err := validateHandler(handler); err != nil {
 		return err
 	}
@@ -327,6 +324,13 @@ func (e *EventBus) Subscribe(topic string, handler any) error {
 
 // Publish 支持通配符的发布
 func (e *EventBus) Publish(topic string, payload any) error {
+	e.lock.RLock()
+	if e.closed {
+		e.lock.RUnlock()
+		return ErrChannelClosed
+	}
+	e.lock.RUnlock()
+
 	startTime := time.Now()
 	metadata := PublishMetadata{
 		Timestamp: startTime,
