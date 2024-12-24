@@ -41,7 +41,7 @@ func (t *MyTracer) OnSlowConsumer(topic string, latency time.Duration) {
 	log.Printf("[Tracer] Slow Consumer: topic=%s, latency=%v\n", topic, latency)
 }
 
-// 定义事件过滤器
+// MyFilter 定义事件过滤器
 type MyFilter struct{}
 
 func (f *MyFilter) Filter(topic string, payload any) bool {
@@ -49,7 +49,7 @@ func (f *MyFilter) Filter(topic string, payload any) bool {
 	return topic != "test"
 }
 
-// 定义中间件
+// LoggingMiddleware 定义中间件
 type LoggingMiddleware struct{}
 
 // Before 在事件处理前执行
