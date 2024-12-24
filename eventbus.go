@@ -3,6 +3,7 @@ package eventbus
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 )
@@ -14,59 +15,83 @@ const (
 	DefaultTimeout = 5 * time.Second
 )
 
-// channel is a struct representing a topic and its associated handlers.
+// channel represents a topic and its associated handlers
 type channel struct {
 	sync.RWMutex
 	bufferSize int
 	topic      string
 	channel    chan any
-	handlers   *CowMap
+	handlers   *CowMap // 存储 Subscription
 	closed     bool
-	stopCh     chan any
+	stopCh     chan struct{}
+	timeout    time.Duration
+	eventBus   *EventBus // 新增：引用 EventBus 实例以访问过滤器和中间件
 }
 
-// newChannel creates a new channel with a specified topic and buffer size.
-// It initializes the handlers map with NewCowMap function and
-// starts a goroutine c.loop() to continuously listen to messages in the channel.
-func newChannel(topic string, bufferSize int) *channel {
+// newChannel creates a new channel with specified topic and buffer size
+func newChannel(topic string, bufferSize int, bus *EventBus) *channel {
 	var ch chan any
 	if bufferSize <= 0 {
 		ch = make(chan any)
 	} else {
 		ch = make(chan any, bufferSize)
 	}
-	c := &channel{
-		topic:      topic,
+
+	return &channel{
 		bufferSize: bufferSize,
+		topic:      topic,
 		channel:    ch,
 		handlers:   NewCowMap(),
-		stopCh:     make(chan any),
+		stopCh:     make(chan struct{}),
+		eventBus:   bus, // 存储 EventBus 引用
 	}
-	go c.loop()
-	return c
 }
 
-// transfer calls all the handlers in the channel with the given payload.
-// It iterates over the handlers in the handlers map to call them with the payload.
+// transfer calls all handlers with the given payload
 func (c *channel) transfer(topic string, payload any) {
-	var payloadValue reflect.Value
-	topicValue := reflect.ValueOf(c.topic)
+	// 应用过滤器
+	for _, filter := range c.eventBus.filters {
+		if !filter.Filter(topic, payload) {
+			return
+		}
+	}
 
-	c.handlers.Range(func(key any, fn any) bool {
-		handler := fn.(*reflect.Value)
+	// 应用中间件 Before 钩子
+	for _, middleware := range c.eventBus.middlewares {
+		payload = middleware.Before(topic, payload)
+	}
+
+	// 获取所有处理器并按优先级排序
+	var subs []*Subscription
+	c.handlers.Range(func(_, value any) bool {
+		if sub, ok := value.(*Subscription); ok {
+			subs = append(subs, sub)
+		}
+		return true
+	})
+	sort.Slice(subs, func(i, j int) bool {
+		return subs[i].Priority > subs[j].Priority
+	})
+
+	// 调用处理器
+	var payloadValue reflect.Value
+	topicValue := reflect.ValueOf(topic)
+	for _, sub := range subs {
+		handler := sub.Handler.(*reflect.Value)
 		typ := handler.Type()
 
 		if payload == nil {
-			// If the parameter passed to the handler is nil,
-			// it initializes a new payload element based on the
-			// type of the second parameter of the handler using the reflect package.
 			payloadValue = reflect.New(typ.In(1)).Elem()
 		} else {
 			payloadValue = reflect.ValueOf(payload)
 		}
-		(*handler).Call([]reflect.Value{topicValue, payloadValue})
-		return true
-	})
+		handler.Call([]reflect.Value{topicValue, payloadValue})
+	}
+
+	// 应用中间件 After 钩子
+	for _, middleware := range c.eventBus.middlewares {
+		middleware.After(topic, payload)
+	}
 }
 
 // loop listens to the channel and calls handlers with payload.
@@ -137,113 +162,84 @@ func (c *channel) unsubscribe(handler any) error {
 func (c *channel) close() {
 	c.Lock()
 	defer c.Unlock()
+
 	if c.closed {
 		return
 	}
+
 	c.closed = true
-	c.stopCh <- struct{}{}
-	c.handlers.Clear()
 	close(c.channel)
+	close(c.stopCh)
+	c.handlers.Clear()
 }
 
 // EventBus is a container for event topics.
 // Each topic corresponds to a channel. `eventbus.Publish()` pushes a message to the channel,
 // and the handler in `eventbus.Subscribe()` will process the message coming out of the channel.
 type EventBus struct {
-	channels   *CowMap
-	bufferSize int
-	once       sync.Once
+	bufferSize  int
+	channels    *CowMap
+	timeout     time.Duration
+	once        sync.Once
+	filters     []EventFilter
+	middlewares []Middleware
 }
 
-// NewBuffered returns new EventBus with a buffered channel.
-// The second argument indicate the buffer's length
-func NewBuffered(bufferSize int) *EventBus {
-	if bufferSize <= 0 {
-		bufferSize = DefaultBufferSize // 使用更合理的默认值
-	}
-	return &EventBus{
-		bufferSize: bufferSize,
-		channels:   NewCowMap(),
-	}
-}
-
-// New returns new EventBus with empty handlers.
+// New creates an unbuffered EventBus
 func New() *EventBus {
 	return &EventBus{
-		bufferSize: -1,
-		channels:   NewCowMap(),
+		bufferSize:  -1,
+		channels:    NewCowMap(),
+		timeout:     DefaultTimeout,
+		filters:     make([]EventFilter, 0),
+		middlewares: make([]Middleware, 0),
 	}
 }
 
-// Unsubscribe removes handler defined for a topic.
-// Returns error if there are no handlers subscribed to the topic.
-func (e *EventBus) Unsubscribe(topic string, handler any) error {
-	ch, ok := e.channels.Load(topic)
-	if !ok {
-		return ErrNoSubscriber
+// NewBuffered creates a buffered EventBus with the specified buffer size
+func NewBuffered(bufferSize int) *EventBus {
+	if bufferSize <= 0 {
+		bufferSize = DefaultBufferSize
 	}
-	return ch.(*channel).unsubscribe(handler)
+	return &EventBus{
+		bufferSize:  bufferSize,
+		channels:    NewCowMap(),
+		timeout:     DefaultTimeout,
+		filters:     make([]EventFilter, 0),
+		middlewares: make([]Middleware, 0),
+	}
 }
 
-// Subscribe subscribes to a topic, return an error if the handler is not a function.
-// The handler must have two parameters: the first parameter must be a string,
-// and the type of the handler's second parameter must be consistent with the type of the payload in `Publish()`
-func (e *EventBus) Subscribe(topic string, handler any) error {
-	typ := reflect.TypeOf(handler)
-	if typ.Kind() != reflect.Func {
+// AddFilter adds an event filter
+func (e *EventBus) AddFilter(filter EventFilter) {
+	e.filters = append(e.filters, filter)
+}
+
+// Use adds a middleware
+func (e *EventBus) Use(middleware Middleware) {
+	e.middlewares = append(e.middlewares, middleware)
+}
+
+// SubscribeWithPriority adds a handler with priority for a topic
+func (e *EventBus) SubscribeWithPriority(topic string, handler any, priority int) error {
+	if reflect.TypeOf(handler).Kind() != reflect.Func {
 		return ErrHandlerIsNotFunc
 	}
-	if typ.NumIn() != 2 {
-		return ErrHandlerParamNum
-	}
-	if typ.In(0).Kind() != reflect.String {
-		return ErrHandlerFirstParam
-	}
 
 	ch, ok := e.channels.Load(topic)
 	if !ok {
-		ch = newChannel(topic, e.bufferSize)
-		e.channels.Store(topic, ch)
-	}
-	return ch.(*channel).subscribe(handler)
-}
-
-// publish triggers the handlers defined for this channel asynchronously.
-// The `payload` argument will be passed to the handler.
-// It uses the channel to asynchronously call the handler.
-// The type of the payload must correspond to the second parameter of the handler in `Subscribe()`.
-func (e *EventBus) Publish(topic string, payload any) error {
-	ch, ok := e.channels.Load(topic)
-
-	if !ok {
-		ch = newChannel(topic, e.bufferSize)
+		ch = newChannel(topic, e.bufferSize, e)
 		e.channels.Store(topic, ch)
 		go ch.(*channel).loop()
 	}
-
-	return ch.(*channel).publish(payload)
-}
-
-// publishSync triggers the handlers defined for this channel synchronously.
-// The payload argument will be passed to the handler.
-// It does not use channels and instead directly calls the handler function.
-func (e *EventBus) PublishSync(topic string, payload any) error {
-	ch, ok := e.channels.Load(topic)
-
-	if !ok {
-		ch = newChannel(topic, e.bufferSize)
-		e.channels.Store(topic, ch)
-		go ch.(*channel).loop()
-	}
-
-	return ch.(*channel).publishSync(payload)
+	return ch.(*channel).subscribeWithPriority(handler, priority)
 }
 
 // PublishWithTimeout 添加带超时的发布方法
 func (e *EventBus) PublishWithTimeout(topic string, payload interface{}, timeout time.Duration) error {
 	ch, ok := e.channels.Load(topic)
 	if !ok {
-		ch = newChannel(topic, e.bufferSize)
+		ch = newChannel(topic, e.bufferSize, e)
 		e.channels.Store(topic, ch)
 	}
 
@@ -291,4 +287,71 @@ func (e *EventBus) HealthCheck() error {
 		return fmt.Errorf("health check failed: %v", errors)
 	}
 	return nil
+}
+
+func (c *channel) subscribeWithPriority(handler any, priority int) error {
+	c.RLock()
+	if c.closed {
+		c.RUnlock()
+		return ErrChannelClosed
+	}
+	c.RUnlock()
+
+	fn := reflect.ValueOf(handler)
+	if fn.Kind() != reflect.Func {
+		return ErrHandlerIsNotFunc
+	}
+
+	// 检查函数参数
+	typ := fn.Type()
+	if typ.NumIn() != 2 {
+		return ErrHandlerParamNum
+	}
+	if typ.In(0).Kind() != reflect.String {
+		return ErrHandlerFirstParam
+	}
+
+	sub := &Subscription{
+		Handler:  &fn,
+		Priority: priority,
+	}
+	c.handlers.Store(fn.Pointer(), sub)
+	return nil
+}
+
+// Subscribe adds a handler for a topic
+func (e *EventBus) Subscribe(topic string, handler any) error {
+	// 使用默认优先级 0 调用 SubscribeWithPriority
+	return e.SubscribeWithPriority(topic, handler, 0)
+}
+
+// Publish sends a message to all subscribers of a topic asynchronously
+func (e *EventBus) Publish(topic string, payload any) error {
+	ch, ok := e.channels.Load(topic)
+	if !ok {
+		ch = newChannel(topic, e.bufferSize, e) // 传入 EventBus 实例
+		e.channels.Store(topic, ch)
+		go ch.(*channel).loop()
+	}
+	return ch.(*channel).publish(payload)
+}
+
+// PublishSync sends a message to all subscribers of a topic synchronously
+func (e *EventBus) PublishSync(topic string, payload any) error {
+	ch, ok := e.channels.Load(topic)
+	if !ok {
+		ch = newChannel(topic, e.bufferSize, e) // 传入 EventBus 实例
+		e.channels.Store(topic, ch)
+		go ch.(*channel).loop()
+	}
+	return ch.(*channel).publishSync(payload)
+}
+
+// Unsubscribe removes a handler from a topic
+func (e *EventBus) Unsubscribe(topic string, handler any) error {
+	ch, ok := e.channels.Load(topic)
+	if !ok {
+		return ErrNoSubscriber
+	}
+	return ch.(*channel).unsubscribe(handler)
 }
