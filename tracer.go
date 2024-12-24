@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -59,6 +60,7 @@ type LatencyStats struct {
 
 // MetricsTracer 实现基础的指标收集
 type MetricsTracer struct {
+	mu              sync.RWMutex             // 添加互斥锁保护 map
 	messageCount    atomic.Int64             // 消息总数
 	errorCount      atomic.Int64             // 错误总数
 	processingTime  atomic.Int64             // 处理总时间(纳秒)
@@ -72,6 +74,9 @@ type MetricsTracer struct {
 func NewMetricsTracer() *MetricsTracer {
 	return &MetricsTracer{
 		subscriberCount: make(map[string]*atomic.Int32),
+		queueStats:      make(map[string]*QueueStats),   // 初始化队列统计 map
+		latencyStats:    make(map[string]*LatencyStats), // 初始化延迟统计 map
+		slowThreshold:   time.Second,                    // 设置默认的慢消费阈值
 	}
 }
 
@@ -84,11 +89,15 @@ func (m *MetricsTracer) OnPublish(topic string, payload any, metadata PublishMet
 
 // OnSubscribe 在订阅时调用
 func (m *MetricsTracer) OnSubscribe(topic string, handler any) {
+	m.mu.Lock() // 获取写锁
 	if _, ok := m.subscriberCount[topic]; !ok {
 		counter := &atomic.Int32{}
 		m.subscriberCount[topic] = counter
 	}
-	m.subscriberCount[topic].Add(1)
+	counter := m.subscriberCount[topic]
+	m.mu.Unlock() // 释放写锁
+
+	counter.Add(1)
 }
 
 // OnUnsubscribe 在取消订阅时调用
@@ -116,15 +125,16 @@ func (m *MetricsTracer) OnComplete(topic string, metadata CompleteMetadata) {
 
 // OnQueueFull 在队列满时调用
 func (m *MetricsTracer) OnQueueFull(topic string, size int) {
+	m.mu.Lock() // 获取写锁
 	stats, ok := m.queueStats[topic]
 	if !ok {
 		stats = &QueueStats{}
 		m.queueStats[topic] = stats
 	}
+	m.mu.Unlock() // 释放写锁
 
 	// 更新统计信息
 	stats.fullCount.Add(1)
-	stats.sampleCount.Add(1)
 
 	// 更新最大队列大小
 	for {
@@ -137,20 +147,22 @@ func (m *MetricsTracer) OnQueueFull(topic string, size int) {
 		}
 	}
 
-	// 更新平均队列大小
-	avgSize := stats.avgSize.Load()
-	sampleCount := stats.sampleCount.Load()
-	newAvg := (avgSize*sampleCount + int64(size)) / (sampleCount + 1)
+	// 更新平均值统计
+	sampleCount := stats.sampleCount.Add(1)
+	currentTotal := stats.avgSize.Load() * (sampleCount - 1)
+	newAvg := (currentTotal + int64(size)) / sampleCount
 	stats.avgSize.Store(newAvg)
 }
 
 // OnSlowConsumer 在慢消费者时调用
 func (m *MetricsTracer) OnSlowConsumer(topic string, latency time.Duration) {
+	m.mu.Lock() // 获取写锁
 	stats, ok := m.latencyStats[topic]
 	if !ok {
 		stats = &LatencyStats{}
 		m.latencyStats[topic] = stats
 	}
+	m.mu.Unlock() // 释放写锁
 
 	// 更新统计信息
 	stats.slowCount.Add(1)
