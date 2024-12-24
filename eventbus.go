@@ -213,22 +213,6 @@ func (e *EventBus) SubscribeWithPriority(topic string, handler any, priority int
 	return ch.(*channel).subscribeWithPriority(handler, priority)
 }
 
-// PublishWithTimeout 添加带超时的发布方法
-func (e *EventBus) PublishWithTimeout(topic string, payload interface{}, timeout time.Duration) error {
-	ch, ok := e.channels.Load(topic)
-	if !ok {
-		ch = newChannel(topic, e.bufferSize, e)
-		e.channels.Store(topic, ch)
-	}
-
-	select {
-	case ch.(*channel).channel <- payload:
-		return nil
-	case <-time.After(timeout):
-		return fmt.Errorf("publish timeout after %v", timeout)
-	}
-}
-
 // Close closes the eventbus
 func (e *EventBus) Close() {
 	e.once.Do(func() {
@@ -388,6 +372,22 @@ func (e *EventBus) PublishSync(topic string, payload any) error {
 		go ch.(*channel).loop()
 	}
 	return ch.(*channel).publishSync(payload)
+}
+
+// PublishWithTimeout 添加带超时的发布方法
+func (e *EventBus) PublishWithTimeout(topic string, payload interface{}, timeout time.Duration) error {
+	ch, ok := e.channels.Load(topic)
+	if !ok {
+		ch = newChannel(topic, e.bufferSize, e)
+		e.channels.Store(topic, ch)
+	}
+
+	select {
+	case ch.(*channel).channel <- payload:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("publish timeout after %v", timeout)
+	}
 }
 
 // Unsubscribe removes a handler from a topic

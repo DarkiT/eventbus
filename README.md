@@ -1,167 +1,155 @@
-<div align='center'>
-<a href="https://github.com/werbenhu/eventbus/actions"><img src="https://github.com/werbenhu/eventbus/workflows/Go/badge.svg"></a>
-<a href="https://goreportcard.com/report/github.com/werbenhu/eventbus"><img src="https://goreportcard.com/badge/github.com/werbenhu/eventbus"></a>
-<a href="https://coveralls.io/github/werbenhu/eventbus?branch=master"><img src="https://coveralls.io/repos/github/werbenhu/eventbus/badge.svg?branch=master"></a>   
-<a href="https://github.com/werbenhu/eventbus"><img src="https://img.shields.io/github/license/mashape/apistatus.svg"></a>
-<a href="https://pkg.go.dev/github.com/werbenhu/eventbus"><img src="https://pkg.go.dev/badge/github.com/werbenhu/eventbus.svg"></a>
-</div>
+# EventBus
 
-[English](README.md) | [简体中文](README-CN.md)
-# eventbus
+一个功能强大的 Go 语言事件总线库，支持异步事件处理、过滤器、中间件、优先级和主题分组等特性。
 
-A lightweight eventbus that simplifies communication between goroutines, it supports synchronous and asynchronous message publishing.
+## 特性
 
-## Installation
+- 异步事件处理
+- 事件过滤器
+- 处理中间件
+- 订阅优先级
+- 主题分组
+- 主题通配符
+- 多种分隔符支持 (. 和 /)
 
-Make sure that go(version 1.18+) is installed on your computer. 
-Type the following command:
+## 安装
 
-`go get github.com/werbenhu/eventbus`
-
-*Import package in your project*
-```go
-import (
-	"github.com/werbenhu/eventbus"
-)
+```bash
+go get github.com/darkit/eventbus
 ```
 
-## What's eventbus?
+## 基础用法
 
-EventBus supports both synchronous and asynchronous message publication. it uses a `Copy-On-Write` map to manage handlers and topics, so it is not recommended for use in scenarios with a large number of frequent subscriptions and unsubscriptions.
-
-#### Asynchronous Way
-
-In EventBus, each topic corresponds to a channel. The `Publish()` method pushes the message to the channel, and the handler in the `Subscribe()` method handles the message that comes out of the channel.If you want to use a buffered EventBus, you can create a buffered EventBus with the `eventbus.NewBuffered(bufferSize int)` method, which will create a buffered channel for each topic.
-
-#### Synchronous Way
-
-In the synchronous way, EventBus does not use channels, but passes payloads to subscribers by calling the handler directly. To publish messages synchronously, use the `eventbus.PublishSync()` function.
-
-### eventbus example
-```go
-package main
-
-import (
-	"fmt"
-	"time"
-
-	"github.com/werbenhu/eventbus"
-)
-
-func handler(topic string, payload int) {
-	fmt.Printf("topic:%s, payload:%d\n", topic, payload)
-}
-
-func main() {
-	bus := eventbus.New()
-
-	// Subscribe to a topic. Returns an error if the handler is not a function.
-	// The handler function must have two parameters: the first parameter must be of type string,
-	// and the second parameter's type must match the type of `payload` in the `Publish()` function.
-	bus.Subscribe("testtopic", handler)
-
-	// Publish a message asynchronously.
-	// The `Publish()` function triggers the handler defined for the topic, and passes the `payload` as an argument.
-	// The type of `payload` must match the type of the second parameter in the handler function defined in `Subscribe()`.
-	bus.Publish("testtopic", 100)
-
-	// Publish a message synchronously.
-	bus.PublishSync("testtopic", 200)
-
-	// Wait a bit to ensure that subscribers have received all asynchronous messages before unsubscribing.
-	time.Sleep(time.Millisecond)
-	bus.Unsubscribe("testtopic", handler)
-
-	// Close the event bus.
-	bus.Close()
-}
-
-```
-
-### Using the global singleton object of EventBus
-To make it more convenient to use EventBus, there is a global singleton object for EventBus. The internal channel of this singleton is unbuffered, and you can directly use `eventbus.Subscribe()`, `eventbus.Publish()`, and `eventbus.Unsubscribe()` to call the corresponding methods of the singleton object.
+### 创建事件总线
 
 ```go
-package main
+// 创建默认事件总线
+bus := eventbus.New()
 
-import (
-	"fmt"
-	"time"
-
-	"github.com/werbenhu/eventbus"
-)
-
-func handler(topic string, payload int) {
-	fmt.Printf("topic:%s, payload:%d\n", topic, payload)
-}
-
-func main() {
-
-	// eventbus.Subscribe() will call the global singleton's Subscribe() method
-	eventbus.Subscribe("testtopic", handler)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		// Asynchronously publish messages
-		for i := 0; i < 100; i++ {
-			// eventbus.Publish() will call the global singleton's Publish() method
-			eventbus.Publish("testtopic", i)
-		}
-		// Synchronously publish messages
-		for i := 100; i < 200; i++ {
-			eventbus.PublishSync("testtopic", i)
-		}
-		wg.Done()
-	}()
-	wg.Wait()
-
-	time.Sleep(time.Millisecond)
-	// eventbus.Unsubscribe() will call the global singleton's Unsubscribe() method
-	eventbus.Unsubscribe("testtopic", handler)
-
-	// eventbus.Close() will call the global singleton's Close() method
-	eventbus.Close()
-}
+// 创建带缓冲的事件总线
+bus := eventbus.NewBuffered(100)
 ```
 
-## Use Pipe instead of channel
+### 发布和订阅
 
-Pipe is a wrapper for a channel without the concept of topics, with the generic parameter corresponding to the type of the channel. `eventbus.NewPipe[T]()` is equivalent to `make(chan T)`. Publishers publish messages, and subscribers receive messages. You can use the `Pipe.Publish()` method instead of `chan <-`, and the `Pipe.Subscribe()` method instead of `<-chan`. 
-
-If there are multiple subscribers, each subscriber will receive every message that is published.If you want to use a buffered channel, you can use the `eventbus.NewBufferedPipe[T](bufferSize int)` method to create a buffered pipe.Pipe also supports synchronous and asynchronous message publishing. If you need to use the synchronous method, call `Pipe.PublishSync()`.
-
-#### pipe example
 ```go
-func handler1(val string) {
-	fmt.Printf("handler1 val:%s\n", val)
+// 订阅事件
+bus.Subscribe("user.created", func(topic string, user User) {
+    fmt.Printf("New user created: %v\n", user)
+})
+
+// 发布事件
+bus.Publish("user.created", User{Name: "John"})
+
+// 同步发布
+bus.PublishSync("user.created", User{Name: "John"})
+```
+
+## 高级特性
+
+### 过滤器
+
+```go
+// 定义过滤器
+type LogFilter struct{}
+
+func (f *LogFilter) Filter(topic string, payload any) bool {
+    fmt.Printf("Processing event: %s\n", topic)
+    return true
 }
 
-func handler2(val string) {
-	fmt.Printf("handler2 val:%s\n", val)
+// 添加过滤器
+bus.AddFilter(&LogFilter{})
+```
+
+### 中间件
+
+```go
+// 定义中间件
+type TimingMiddleware struct{}
+
+func (m *TimingMiddleware) Before(topic string, payload any) any {
+    // 前置处理
+    return payload
 }
 
-func main() {
-	pipe := eventbus.NewPipe[string]()
-	pipe.Subscribe(handler1)
-	pipe.Subscribe(handler2)
+func (m *TimingMiddleware) After(topic string, payload any) {
+    // 后置处理
+}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		for i := 0; i < 100; i++ {
-			pipe.Publish(strconv.Itoa(i))
-		}
-		for i := 100; i < 200; i++ {
-			pipe.PublishSync(strconv.Itoa(i))
-		}
-		wg.Done()
-	}()
-	wg.Wait()
+// 添加中间件
+bus.AddMiddleware(&TimingMiddleware{})
+```
 
-	time.Sleep(time.Millisecond)
-	pipe.Unsubscribe(handler1)
-	pipe.Unsubscribe(handler2)
-	pipe.Close()
+### 优先级订阅
+
+```go
+// 高优先级订阅
+bus.SubscribeWithPriority("user.created", handler, 10)
+
+// 低优先级订阅
+bus.SubscribeWithPriority("user.created", handler, 1)
+```
+
+### 主题分组
+
+```go
+// 创建主题组
+userGroup := bus.NewGroup("user")
+
+// 在组内订阅
+userGroup.Subscribe("created", handler)
+
+// 在组内发布
+userGroup.Publish("created", user)
+```
+
+### 通配符订阅
+
+```go
+// 单层通配符
+bus.Subscribe("user.*.created", handler)  // 匹配 user.admin.created, user.guest.created
+
+// 多层通配符
+bus.Subscribe("user.#", handler)  // 匹配所有 user. 开头的主题
+```
+
+### 多分隔符支持
+
+```go
+// 这些主题是等价的
+bus.Subscribe("user.created", handler)
+bus.Subscribe("user/created", handler)
+```
+
+### 超时发布
+
+```go
+// 带超时的发布
+err := bus.PublishWithTimeout("user.created", user, 5*time.Second)
+if err == ErrTimeout {
+    log.Println("发布超时")
 }
 ```
+
+## 线程安全
+
+EventBus 是线程安全的，可以在多个 goroutine 中安全使用。
+
+## 错误处理
+
+```go
+if err := bus.Publish("topic", payload); err != nil {
+    log.Printf("Failed to publish: %v", err)
+}
+```
+
+## 性能考虑
+
+- 使用 NewBuffered 创建带缓冲的事件总线可以提高性能
+- 优先级订阅会略微影响性能
+- 通配符匹配会带来一定的性能开销
+
+## 许可证
+
+MIT License
