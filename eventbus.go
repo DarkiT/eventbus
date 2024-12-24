@@ -427,6 +427,16 @@ func (e *EventBus) Unsubscribe(topic string, handler any) error {
 	return ch.(*channel).unsubscribe(handler)
 }
 
+// UnsubscribeAll 移除某个主题的所有处理器
+func (e *EventBus) UnsubscribeAll(topic string) error {
+	ch, ok := e.channels.Load(topic)
+	if !ok {
+		return ErrNoSubscriber
+	}
+	ch.(*channel).handlers.Clear()
+	return nil
+}
+
 // validateHandler 验证处理器函数的合法性
 func validateHandler(handler any) error {
 	if reflect.TypeOf(handler).Kind() != reflect.Func {

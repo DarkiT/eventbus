@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/darkit/eventbus.svg)](https://pkg.go.dev/github.com/darkit/eventbus)
 [![Go Report Card](https://goreportcard.com/badge/github.com/darkit/eventbus)](https://goreportcard.com/report/github.com/darkit/eventbus)
-[![Coverage Status](https://coveralls.io/repos/github/darkit/eventbus/badge.svg?branch=master)](https://coveralls.io/github/darkit/eventbus?branch=master)
+[![Coverage Status](https://coveralls.io/repos/github/DarkiT/eventbus/badge.svg?branch=master)](https://coveralls.io/github/DarkiT/eventbus?branch=master)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 EventBus 是一个高性能的 Go 事件总线库,提供了事件发布/订阅、事件追踪、过滤器、中间件等功能。基于写时复制(Copy-on-Write)机制实现高并发性能。
