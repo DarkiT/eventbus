@@ -3,6 +3,7 @@ package eventbus
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -98,6 +99,38 @@ func Test_SingletonPublishSync(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	Close()
+}
+
+func Test_SingletonPublishWithTimeout(t *testing.T) {
+	ResetSingleton()
+	assert.NotNil(t, singleton, "Singleton should be initialized")
+
+	// 测试超时情况
+	err := Subscribe("slowtopic", func(topic string, msg interface{}) {
+		time.Sleep(2 * time.Second)
+	})
+	assert.Nil(t, err, "Subscribe should succeed")
+
+	err = PublishWithTimeout("slowtopic", "test", time.Second)
+	assert.NotNil(t, err, "Should timeout")
+	assert.Contains(t, err.Error(), "timeout")
+
+	// 测试正常情况
+	processed := false
+	err = Subscribe("fasttopic", func(topic string, msg interface{}) {
+		processed = true
+	})
+	assert.Nil(t, err, "Subscribe should succeed")
+
+	err = PublishWithTimeout("fasttopic", "test", 2*time.Second)
+	assert.Nil(t, err, "Should not timeout")
+	assert.True(t, processed, "Message should have been processed")
+
+	// 测试无订阅者情况
+	err = PublishWithTimeout("notopic", "test", time.Second)
+	assert.Nil(t, err, "Should succeed with no subscribers")
+
 	Close()
 }
 

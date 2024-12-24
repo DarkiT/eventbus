@@ -1,5 +1,7 @@
 package eventbus
 
+import "time"
+
 // singleton 是一个指向无缓冲 EventBus 实例的指针，该实例将在必要时创建。
 var singleton *EventBus
 
@@ -39,6 +41,12 @@ func Publish(topic string, payload any) error {
 // payload 的类型必须与 `Subscribe()` 中处理器的第二个参数类型一致。
 func PublishSync(topic string, payload any) error {
 	return singleton.Publish(topic, payload)
+}
+
+// PublishWithTimeout 添加带超时的发布方法
+// payload 的类型必须与 `Subscribe()` 中处理器的第二个参数类型一致。
+func PublishWithTimeout(topic string, payload interface{}, timeout time.Duration) error {
+	return singleton.PublishWithTimeout(topic, payload, timeout)
 }
 
 // Close 关闭 EventBus 的单例实例。

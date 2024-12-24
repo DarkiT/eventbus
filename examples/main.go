@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -126,19 +127,20 @@ func main() {
 	// 发布全局事件
 	eventbus.Publish("global.event", "Hello World")
 	eventbus.PublishSync("global.event", "Hello Again")
+	eventbus.PublishWithTimeout("global.event", "Hello Again", 3*time.Second)
 
 	// 4. 错误处理示例
 	fmt.Println("\n=== Error Handling ===")
 
 	// 无效的处理器
 	err := bus.Subscribe("topic", "not a function")
-	if err == eventbus.ErrHandlerIsNotFunc {
+	if errors.Is(err, eventbus.ErrHandlerIsNotFunc) {
 		fmt.Println("Error: Handler must be a function")
 	}
 
 	// 发布到已关闭的通道
 	pipe.Close()
-	if err := pipe.Publish(200); err == eventbus.ErrChannelClosed {
+	if err := pipe.Publish(200); errors.Is(err, eventbus.ErrChannelClosed) {
 		fmt.Println("Error: Channel is closed")
 	}
 

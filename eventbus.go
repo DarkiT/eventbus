@@ -389,26 +389,78 @@ func (e *EventBus) Publish(topic string, payload any) error {
 
 // PublishSync 同步发送消息到所有订阅者
 func (e *EventBus) PublishSync(topic string, payload any) error {
-	ch, ok := e.channels.Load(topic)
-	if !ok {
-		ch = newChannel(topic, e.bufferSize, e) // 传入 EventBus 实例
-		e.channels.Store(topic, ch)
-		go ch.(*channel).loop()
+	startTime := time.Now()
+	metadata := PublishMetadata{
+		Timestamp: startTime,
+		Async:     false,
+		QueueSize: e.bufferSize,
 	}
-	return ch.(*channel).publishSync(payload)
+
+	if e.tracer != nil {
+		e.tracer.OnPublish(topic, payload, metadata)
+	}
+
+	// 标准化主题
+	topic = normalizeTopic(topic)
+
+	// 应用过滤器
+	for _, filter := range e.filters {
+		if !filter.Filter(topic, payload) {
+			return nil
+		}
+	}
+
+	// 应用中间件
+	handler := func(topic string, payload any) error {
+		// 查找所有匹配的订阅者
+		var lastErr error
+		e.channels.Range(func(key, value any) bool {
+			pattern := key.(string)
+			if matchTopic(pattern, topic) {
+				if err := value.(*channel).publishSync(payload); err != nil {
+					lastErr = err
+					if e.tracer != nil {
+						e.tracer.OnError(topic, err)
+					}
+				}
+			}
+			return true
+		})
+		return lastErr
+	}
+
+	// 包装中间件
+	for i := len(e.middlewares) - 1; i >= 0; i-- {
+		mw := e.middlewares[i]
+		next := handler
+		handler = func(t string, p any) error {
+			// 执行前置处理
+			p = mw.Before(t, p)
+
+			// 执行处理
+			err := next(t, p)
+
+			// 执行后置处理
+			mw.After(t, p)
+
+			return err
+		}
+	}
+
+	// 执行处理链
+	return handler(topic, payload)
 }
 
 // PublishWithTimeout 添加带超时的发布方法
 func (e *EventBus) PublishWithTimeout(topic string, payload interface{}, timeout time.Duration) error {
-	ch, ok := e.channels.Load(topic)
-	if !ok {
-		ch = newChannel(topic, e.bufferSize, e)
-		e.channels.Store(topic, ch)
-	}
+	done := make(chan error, 1)
+	go func() {
+		done <- e.PublishSync(topic, payload)
+	}()
 
 	select {
-	case ch.(*channel).channel <- payload:
-		return nil
+	case err := <-done:
+		return err
 	case <-time.After(timeout):
 		return fmt.Errorf("publish timeout after %v", timeout)
 	}
