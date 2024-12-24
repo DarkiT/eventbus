@@ -164,4 +164,39 @@ func main() {
 
 	// 等待一会儿让异步事件完成
 	time.Sleep(time.Second)
+
+	// 6. 分组和通配符示例
+	fmt.Println("\n=== Groups and Wildcards Usage ===")
+
+	// 使用通配符订阅所有用户事件
+	bus.Subscribe("user.*", func(topic string, payload any) {
+		fmt.Printf("Wildcard user event: topic=%s, payload=%v\n", topic, payload)
+	})
+
+	// 使用通配符订阅所有系统事件
+	bus.Subscribe("system.#", func(topic string, payload any) {
+		fmt.Printf("Wildcard system event: topic=%s, payload=%v\n", topic, payload)
+	})
+
+	// 发布不同的事件来测试通配符匹配
+	bus.Publish("user.login", map[string]string{"username": "john"})
+	bus.Publish("user.logout", map[string]string{"username": "john"})
+	bus.Publish("system.cpu.high", 85)
+	bus.Publish("system.memory.low", 20)
+	bus.Publish("system.disk.full", "/dev/sda1")
+
+	// 使用分组订阅
+	bus.Subscribe("notifications/email/*", func(topic string, payload any) {
+		fmt.Printf("Email notification: %v\n", payload)
+	})
+	bus.Subscribe("notifications/sms/*", func(topic string, payload any) {
+		fmt.Printf("SMS notification: %v\n", payload)
+	})
+
+	// 发布分组消息
+	bus.Publish("notifications/email/welcome", "Welcome to our service!")
+	bus.Publish("notifications/sms/verification", "Your code is 123456")
+
+	// 等待异步事件完成
+	time.Sleep(time.Second)
 }
