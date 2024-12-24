@@ -5,26 +5,26 @@ import (
 	"time"
 )
 
-// Handler defines a function type that handles messages of type T
+// Handler 定义了一个函数类型，用于处理 T 类型的消息
 type Handler[T any] func(payload T)
 
-// Pipe is a generic wrapper for channel-based message passing
+// Pipe 是一个通用的管道封装，用于基于通道的消息传递
 type Pipe[T any] struct {
 	sync.RWMutex
 	bufferSize int
 	channel    chan T
-	handlers   *CowMap
+	handlers   *_CowMap
 	closed     bool
 	stopCh     chan struct{}
 	timeout    time.Duration
 }
 
-// NewPipe creates an unbuffered pipe
+// NewPipe 创建一个无缓冲的管道
 func NewPipe[T any]() *Pipe[T] {
 	return newPipe[T](-1)
 }
 
-// NewBufferedPipe creates a buffered pipe with the specified buffer size
+// NewBufferedPipe 创建一个带指定缓冲区大小的管道
 func NewBufferedPipe[T any](bufferSize int) *Pipe[T] {
 	return newPipe[T](bufferSize)
 }
@@ -40,7 +40,7 @@ func newPipe[T any](bufferSize int) *Pipe[T] {
 	p := &Pipe[T]{
 		bufferSize: bufferSize,
 		channel:    ch,
-		handlers:   NewCowMap(),
+		handlers:   newCowMap(),
 		stopCh:     make(chan struct{}),
 		timeout:    DefaultTimeout,
 	}
@@ -49,7 +49,7 @@ func newPipe[T any](bufferSize int) *Pipe[T] {
 	return p
 }
 
-// SetTimeout sets the timeout duration for publish operations
+// SetTimeout 设置发布操作的超时时间
 func (p *Pipe[T]) SetTimeout(timeout time.Duration) {
 	p.timeout = timeout
 }
@@ -70,7 +70,7 @@ func (p *Pipe[T]) loop() {
 	}
 }
 
-// Subscribe adds a handler to the pipe
+// Subscribe 向管道添加一个处理器
 func (p *Pipe[T]) Subscribe(handler Handler[T]) error {
 	p.RLock()
 	if p.closed {
@@ -83,7 +83,7 @@ func (p *Pipe[T]) Subscribe(handler Handler[T]) error {
 	return nil
 }
 
-// Unsubscribe removes a handler from the pipe
+// Unsubscribe 从管道中移除一个处理器
 func (p *Pipe[T]) Unsubscribe(handler Handler[T]) error {
 	p.RLock()
 	if p.closed {
@@ -96,7 +96,7 @@ func (p *Pipe[T]) Unsubscribe(handler Handler[T]) error {
 	return nil
 }
 
-// Publish sends a message to all subscribers asynchronously with timeout
+// Publish 异步发送消息给所有订阅者，并设置超时时间
 func (p *Pipe[T]) Publish(payload T) error {
 	p.RLock()
 	if p.closed {
@@ -115,7 +115,7 @@ func (p *Pipe[T]) Publish(payload T) error {
 	}
 }
 
-// PublishSync sends a message to all subscribers synchronously
+// PublishSync 同步发送消息给所有订阅者
 func (p *Pipe[T]) PublishSync(payload T) error {
 	p.RLock()
 	if p.closed {
@@ -133,7 +133,7 @@ func (p *Pipe[T]) PublishSync(payload T) error {
 	return nil
 }
 
-// Close shuts down the pipe
+// Close 关闭管道
 func (p *Pipe[T]) Close() {
 	p.Lock()
 	defer p.Unlock()
@@ -148,14 +148,14 @@ func (p *Pipe[T]) Close() {
 	p.handlers.Clear()
 }
 
-// IsClosed returns whether the pipe is closed
+// IsClosed 返回管道是否已关闭
 func (p *Pipe[T]) IsClosed() bool {
 	p.RLock()
 	defer p.RUnlock()
 	return p.closed
 }
 
-// Len returns the number of subscribers
+// Len 返回订阅者的数量
 func (p *Pipe[T]) Len() uint32 {
 	return p.handlers.Len()
 }

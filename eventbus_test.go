@@ -166,7 +166,7 @@ func Test_NewBuffered(t *testing.T) {
 
 	busZero := NewBuffered(0)
 	assert.NotNil(t, busZero)
-	assert.Equal(t, 1024, busZero.bufferSize)
+	assert.Equal(t, 512, busZero.bufferSize)
 	assert.NotNil(t, busZero.channels)
 	busZero.Close()
 }

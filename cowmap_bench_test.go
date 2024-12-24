@@ -22,8 +22,8 @@ func BenchmarkSingleGoroutineStoreAbsentBySyncMap(b *testing.B) {
 	}
 }
 
-func BenchmarkSingleGoroutineStoreAbsentByCowMap(b *testing.B) {
-	m := NewCowMap()
+func BenchmarkSingleGoroutineStoreAbsentBy_CowMap(b *testing.B) {
+	m := newCowMap()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		m.Store(strconv.Itoa(i), "value")
@@ -48,8 +48,8 @@ func BenchmarkSingleGoroutineStorePresentBySyncMap(b *testing.B) {
 	}
 }
 
-func BenchmarkSingleGoroutineStorePresentByCowMap(b *testing.B) {
-	m := NewCowMap()
+func BenchmarkSingleGoroutineStorePresentBy_CowMap(b *testing.B) {
+	m := newCowMap()
 	m.Store("key", "value")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -78,8 +78,8 @@ func BenchmarkMultiGoroutineLoadDifferentBySyncMap(b *testing.B) {
 	}
 }
 
-func BenchmarkMultiGoroutineLoadDifferentByCowMap(b *testing.B) {
-	m := NewCowMap()
+func BenchmarkMultiGoroutineLoadDifferentBy_CowMap(b *testing.B) {
+	m := newCowMap()
 	finished := make(chan struct{}, b.N)
 	for i := 0; i < 1000; i++ {
 		m.Store(i, i)
@@ -117,8 +117,8 @@ func BenchmarkMultiGoroutineLoadSameBySyncMap(b *testing.B) {
 	}
 }
 
-func BenchmarkMultiGoroutineLoadSameByCowMap(b *testing.B) {
-	m := NewCowMap()
+func BenchmarkMultiGoroutineLoadSameBy_CowMap(b *testing.B) {
+	m := newCowMap()
 	finished := make(chan struct{}, b.N)
 	m.Store("key", "value")
 	b.ResetTimer()
@@ -135,16 +135,16 @@ func BenchmarkMultiGoroutineLoadSameByCowMap(b *testing.B) {
 	}
 }
 
-func Benchmark_CowMapStore(b *testing.B) {
-	m := NewCowMap()
+func Benchmark__CowMapStore(b *testing.B) {
+	m := newCowMap()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		m.Store(i, strconv.Itoa(i))
 	}
 }
 
-func Benchmark_CowMapLoad(b *testing.B) {
-	m := NewCowMap()
+func Benchmark__CowMapLoad(b *testing.B) {
+	m := newCowMap()
 	for i := 0; i < 1000; i++ {
 		m.Store(i, strconv.Itoa(i))
 	}

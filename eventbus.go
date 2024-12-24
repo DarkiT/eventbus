@@ -8,26 +8,27 @@ import (
 )
 
 const (
-	// DefaultBufferSize is the default channel buffer size
-	DefaultBufferSize = 1024
-	// DefaultTimeout is the default timeout for publish operations
+	// DefaultBufferSize 是默认的通道缓冲区大小
+	DefaultBufferSize = 512
+	// DefaultTimeout 是发布操作的默认超时时间
 	DefaultTimeout = 5 * time.Second
+	// slowConsumerThreshold 是慢消费者的阈值
+	slowConsumerThreshold = 100 * time.Millisecond
 )
 
-// channel represents a topic and its associated handlers
 type channel struct {
 	sync.RWMutex
 	bufferSize int
 	topic      string
 	channel    chan any
-	handlers   *CowMap // 存储 Subscription
+	handlers   *_CowMap
 	closed     bool
 	stopCh     chan struct{}
 	timeout    time.Duration
-	eventBus   *EventBus // 新增：引用 EventBus 实例以访问过滤器和中间件
+	eventBus   *EventBus
 }
 
-// newChannel creates a new channel with specified topic and buffer size
+// newChannel 创建一个新的 channel，指定主题和缓冲区大小
 func newChannel(topic string, bufferSize int, bus *EventBus) *channel {
 	var ch chan any
 	if bufferSize <= 0 {
@@ -40,13 +41,13 @@ func newChannel(topic string, bufferSize int, bus *EventBus) *channel {
 		bufferSize: bufferSize,
 		topic:      topic,
 		channel:    ch,
-		handlers:   NewCowMap(),
+		handlers:   newCowMap(),
 		stopCh:     make(chan struct{}),
 		eventBus:   bus, // 存储 EventBus 引用
 	}
 }
 
-// transfer calls all handlers with the given payload
+// transfer 调用所有处理器并传递给定的负载
 func (c *channel) transfer(topic string, payload any) {
 	c.RLock()
 	defer c.RUnlock()
@@ -66,9 +67,7 @@ func (c *channel) transfer(topic string, payload any) {
 	})
 }
 
-// loop listens to the channel and calls handlers with payload.
-// It receives messages from the channel and then iterates over the handlers
-// in the handlers map to call them with the payload.
+// loop 监听通道并用负载调用处理器。 它从通道接收消息，然后遍历处理器映射并调用它们。
 func (c *channel) loop() {
 	for {
 		select {
@@ -80,7 +79,7 @@ func (c *channel) loop() {
 	}
 }
 
-// subscribe add a handler to a channel, return error if the channel is closed.
+// subscribe 添加处理器到通道，如果通道已关闭则返回错误
 func (c *channel) subscribe(handler any) error {
 	c.RLock()
 	defer c.RUnlock()
@@ -92,7 +91,7 @@ func (c *channel) subscribe(handler any) error {
 	return nil
 }
 
-// publishSync triggers the handlers defined for this channel synchronously
+// publishSync 同步触发该通道定义的处理器
 func (c *channel) publishSync(payload any) error {
 	c.RLock()
 	defer c.RUnlock()
@@ -108,9 +107,9 @@ func (c *channel) publishSync(payload any) error {
 	return nil
 }
 
-// publish triggers the handlers defined for this channel asynchronously.
-// The `payload` argument will be passed to the handler.
-// It uses the channel to asynchronously call the handler.
+// publish 异步触发该通道定义的处理器。
+// `payload` 参数将被传递给处理器。
+// 它使用通道异步调用处理器。
 func (c *channel) publish(payload any) error {
 	c.RLock()
 	defer c.RUnlock()
@@ -118,12 +117,26 @@ func (c *channel) publish(payload any) error {
 		return ErrChannelClosed
 	}
 
-	// 直接调用 transfer，不使用 channel
+	// 检查队列是否满
+	if c.bufferSize > 0 && len(c.channel) >= c.bufferSize {
+		if c.eventBus.tracer != nil {
+			c.eventBus.tracer.OnQueueFull(c.topic, len(c.channel))
+		}
+	}
+
+	startTime := time.Now()
 	c.transfer(c.topic, payload)
+
+	// 检查处理延迟
+	latency := time.Since(startTime)
+	if latency > slowConsumerThreshold && c.eventBus.tracer != nil {
+		c.eventBus.tracer.OnSlowConsumer(c.topic, latency)
+	}
+
 	return nil
 }
 
-// unsubscribe removes handler defined for this channel.
+// unsubscribe 移除该通道的处理器
 func (c *channel) unsubscribe(handler any) error {
 	c.RLock()
 	defer c.RUnlock()
@@ -135,7 +148,7 @@ func (c *channel) unsubscribe(handler any) error {
 	return nil
 }
 
-// close closes a channel
+// close 关闭通道
 func (c *channel) close() {
 	c.Lock()
 	defer c.Unlock()
@@ -150,12 +163,12 @@ func (c *channel) close() {
 	c.handlers.Clear()
 }
 
-// EventBus is a container for event topics.
-// Each topic corresponds to a channel. `eventbus.Publish()` pushes a message to the channel,
-// and the handler in `eventbus.Subscribe()` will process the message coming out of the channel.
+// EventBus 是事件主题的容器。
+// 每个主题对应一个通道。`eventbus.Publish()` 将消息推送到通道，
+// 然后 `eventbus.Subscribe()` 中的处理器会处理通道中的消息。
 type EventBus struct {
 	bufferSize  int
-	channels    *CowMap
+	channels    *_CowMap
 	timeout     time.Duration
 	once        sync.Once
 	filters     []EventFilter
@@ -163,42 +176,47 @@ type EventBus struct {
 	tracer      EventTracer
 }
 
-// New creates an unbuffered EventBus
+// New 创建一个无缓冲的 EventBus
 func New() *EventBus {
 	return &EventBus{
 		bufferSize:  -1,
-		channels:    NewCowMap(),
+		channels:    newCowMap(),
 		timeout:     DefaultTimeout,
 		filters:     make([]EventFilter, 0),
 		middlewares: make([]Middleware, 0),
 	}
 }
 
-// NewBuffered creates a buffered EventBus with the specified buffer size
+// NewBuffered 创建一个有缓冲区大小的 EventBus
 func NewBuffered(bufferSize int) *EventBus {
 	if bufferSize <= 0 {
 		bufferSize = DefaultBufferSize
 	}
 	return &EventBus{
 		bufferSize:  bufferSize,
-		channels:    NewCowMap(),
+		channels:    newCowMap(),
 		timeout:     DefaultTimeout,
 		filters:     make([]EventFilter, 0),
 		middlewares: make([]Middleware, 0),
 	}
 }
 
-// AddFilter adds an event filter
+// AddFilter 添加事件过滤器
 func (e *EventBus) AddFilter(filter EventFilter) {
 	e.filters = append(e.filters, filter)
 }
 
-// Use adds a middleware
+// SetTracer 添加事件追踪器
+func (e *EventBus) SetTracer(tracer EventTracer) {
+	e.tracer = tracer
+}
+
+// Use 添加中间件
 func (e *EventBus) Use(middleware Middleware) {
 	e.middlewares = append(e.middlewares, middleware)
 }
 
-// SubscribeWithPriority adds a handler with priority for a topic
+// SubscribeWithPriority 为某个主题添加优先级处理器
 func (e *EventBus) SubscribeWithPriority(topic string, handler any, priority int) error {
 	if reflect.TypeOf(handler).Kind() != reflect.Func {
 		return ErrHandlerIsNotFunc
@@ -213,7 +231,23 @@ func (e *EventBus) SubscribeWithPriority(topic string, handler any, priority int
 	return ch.(*channel).subscribeWithPriority(handler, priority)
 }
 
-// Close closes the eventbus
+// HealthCheck 健康检查
+func (e *EventBus) HealthCheck() error {
+	var errors []error
+	e.channels.Range(func(key, value interface{}) bool {
+		ch := value.(*channel)
+		if ch.closed {
+			errors = append(errors, fmt.Errorf("channel %v is closed", key))
+		}
+		return true
+	})
+	if len(errors) > 0 {
+		return fmt.Errorf("health check failed: %v", errors)
+	}
+	return nil
+}
+
+// Close 关闭 eventbus
 func (e *EventBus) Close() {
 	e.once.Do(func() {
 		e.channels.Range(func(key, value interface{}) bool {
@@ -236,21 +270,7 @@ func (e *EventBus) Close() {
 	})
 }
 
-func (e *EventBus) HealthCheck() error {
-	var errors []error
-	e.channels.Range(func(key, value interface{}) bool {
-		ch := value.(*channel)
-		if ch.closed {
-			errors = append(errors, fmt.Errorf("channel %v is closed", key))
-		}
-		return true
-	})
-	if len(errors) > 0 {
-		return fmt.Errorf("health check failed: %v", errors)
-	}
-	return nil
-}
-
+// subscribeWithPriority 添加优先级处理器
 func (c *channel) subscribeWithPriority(handler any, priority int) error {
 	c.RLock()
 	if c.closed {
@@ -285,6 +305,10 @@ func (c *channel) subscribeWithPriority(handler any, priority int) error {
 func (e *EventBus) Subscribe(topic string, handler any) error {
 	if err := validateHandler(handler); err != nil {
 		return err
+	}
+
+	if e.tracer != nil {
+		e.tracer.OnSubscribe(topic, handler)
 	}
 
 	// 标准化主题
@@ -363,7 +387,7 @@ func (e *EventBus) Publish(topic string, payload any) error {
 	return handler(topic, payload)
 }
 
-// PublishSync sends a message to all subscribers of a topic synchronously
+// PublishSync 同步发送消息到所有订阅者
 func (e *EventBus) PublishSync(topic string, payload any) error {
 	ch, ok := e.channels.Load(topic)
 	if !ok {
@@ -390,8 +414,12 @@ func (e *EventBus) PublishWithTimeout(topic string, payload interface{}, timeout
 	}
 }
 
-// Unsubscribe removes a handler from a topic
+// Unsubscribe 移除某个主题的处理器
 func (e *EventBus) Unsubscribe(topic string, handler any) error {
+	if e.tracer != nil {
+		e.tracer.OnUnsubscribe(topic, handler)
+	}
+
 	ch, ok := e.channels.Load(topic)
 	if !ok {
 		return ErrNoSubscriber

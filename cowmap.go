@@ -5,21 +5,21 @@ import (
 	"sync/atomic"
 )
 
-// CowMap implements a thread-safe map using the Copy-on-Write pattern
-type CowMap struct {
+// _CowMap 实现了一个线程安全的映射，使用的是写时复制（Copy-on-Write）模式
+type _CowMap struct {
 	mu    sync.RWMutex
-	items atomic.Value // stores map[interface{}]interface{}
+	items atomic.Value
 }
 
-// NewCowMap creates a new CowMap instance
-func NewCowMap() *CowMap {
-	cm := &CowMap{}
+// newCowMap 创建一个新的 _CowMap 实例
+func newCowMap() *_CowMap {
+	cm := &_CowMap{}
 	cm.items.Store(make(map[interface{}]interface{}))
 	return cm
 }
 
-// Store adds or updates an item in the map
-func (c *CowMap) Store(key, value interface{}) {
+// Store 向 map 中添加或更新一个项
+func (c *_CowMap) Store(key, value interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -33,15 +33,15 @@ func (c *CowMap) Store(key, value interface{}) {
 	c.items.Store(newMap)
 }
 
-// Load retrieves an item from the map
-func (c *CowMap) Load(key interface{}) (value interface{}, ok bool) {
+// Load 从 map 中获取一个项
+func (c *_CowMap) Load(key interface{}) (value interface{}, ok bool) {
 	currentMap := c.items.Load().(map[interface{}]interface{})
 	value, ok = currentMap[key]
 	return
 }
 
-// Delete removes an item from the map
-func (c *CowMap) Delete(key interface{}) {
+// Delete 从 map 中删除一个项
+func (c *_CowMap) Delete(key interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -59,8 +59,8 @@ func (c *CowMap) Delete(key interface{}) {
 	c.items.Store(newMap)
 }
 
-// Range iterates over the items in the map
-func (c *CowMap) Range(f func(key, value interface{}) bool) {
+// Range 遍历 map 中的项
+func (c *_CowMap) Range(f func(key, value interface{}) bool) {
 	currentMap := c.items.Load().(map[interface{}]interface{})
 	for k, v := range currentMap {
 		if !f(k, v) {
@@ -69,14 +69,14 @@ func (c *CowMap) Range(f func(key, value interface{}) bool) {
 	}
 }
 
-// Len returns the number of items in the map
-func (c *CowMap) Len() uint32 {
+// Len 返回 map 中项的数量
+func (c *_CowMap) Len() uint32 {
 	currentMap := c.items.Load().(map[interface{}]interface{})
 	return uint32(len(currentMap))
 }
 
-// Clear removes all items from the map
-func (c *CowMap) Clear() {
+// Clear 移除 map 中的所有项
+func (c *_CowMap) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items.Store(make(map[interface{}]interface{}))
