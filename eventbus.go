@@ -3,7 +3,6 @@ package eventbus
 import (
 	"fmt"
 	"reflect"
-	"sort"
 	"sync"
 	"time"
 )
@@ -49,49 +48,22 @@ func newChannel(topic string, bufferSize int, bus *EventBus) *channel {
 
 // transfer calls all handlers with the given payload
 func (c *channel) transfer(topic string, payload any) {
-	// 应用过滤器
-	for _, filter := range c.eventBus.filters {
-		if !filter.Filter(topic, payload) {
-			return
-		}
-	}
+	c.RLock()
+	defer c.RUnlock()
 
-	// 应用中间件 Before 钩子
-	for _, middleware := range c.eventBus.middlewares {
-		payload = middleware.Before(topic, payload)
-	}
-
-	// 获取所有处理器并按优先级排序
-	var subs []*Subscription
+	// 获取所有处理器
 	c.handlers.Range(func(_, value any) bool {
-		if sub, ok := value.(*Subscription); ok {
-			subs = append(subs, sub)
+		if fn, ok := value.(*reflect.Value); ok && fn != nil {
+			// 确保参数不为空
+			topicVal := reflect.ValueOf(topic)
+			payloadVal := reflect.ValueOf(payload)
+			if !topicVal.IsValid() || !payloadVal.IsValid() {
+				return true
+			}
+			fn.Call([]reflect.Value{topicVal, payloadVal})
 		}
 		return true
 	})
-	sort.Slice(subs, func(i, j int) bool {
-		return subs[i].Priority > subs[j].Priority
-	})
-
-	// 调用处理器
-	var payloadValue reflect.Value
-	topicValue := reflect.ValueOf(topic)
-	for _, sub := range subs {
-		handler := sub.Handler.(*reflect.Value)
-		typ := handler.Type()
-
-		if payload == nil {
-			payloadValue = reflect.New(typ.In(1)).Elem()
-		} else {
-			payloadValue = reflect.ValueOf(payload)
-		}
-		handler.Call([]reflect.Value{topicValue, payloadValue})
-	}
-
-	// 应用中间件 After 钩子
-	for _, middleware := range c.eventBus.middlewares {
-		middleware.After(topic, payload)
-	}
 }
 
 // loop listens to the channel and calls handlers with payload.
@@ -120,15 +92,18 @@ func (c *channel) subscribe(handler any) error {
 	return nil
 }
 
-// publishSync triggers the handlers defined for this channel synchronously.
-// The payload argument will be passed to the handler.
-// It does not use channels and instead directly calls the handler function.
+// publishSync triggers the handlers defined for this channel synchronously
 func (c *channel) publishSync(payload any) error {
 	c.RLock()
 	defer c.RUnlock()
 	if c.closed {
 		return ErrChannelClosed
 	}
+
+	if payload == nil {
+		return nil
+	}
+
 	c.transfer(c.topic, payload)
 	return nil
 }
@@ -142,7 +117,9 @@ func (c *channel) publish(payload any) error {
 	if c.closed {
 		return ErrChannelClosed
 	}
-	c.channel <- payload
+
+	// 直接调用 transfer，不使用 channel
+	c.transfer(c.topic, payload)
 	return nil
 }
 
@@ -183,6 +160,7 @@ type EventBus struct {
 	once        sync.Once
 	filters     []EventFilter
 	middlewares []Middleware
+	tracer      EventTracer
 }
 
 // New creates an unbuffered EventBus
@@ -319,21 +297,86 @@ func (c *channel) subscribeWithPriority(handler any, priority int) error {
 	return nil
 }
 
-// Subscribe adds a handler for a topic
+// Subscribe 支持通配符的订阅
 func (e *EventBus) Subscribe(topic string, handler any) error {
-	// 使用默认优先级 0 调用 SubscribeWithPriority
-	return e.SubscribeWithPriority(topic, handler, 0)
-}
+	if err := validateHandler(handler); err != nil {
+		return err
+	}
 
-// Publish sends a message to all subscribers of a topic asynchronously
-func (e *EventBus) Publish(topic string, payload any) error {
+	// 标准化主题
+	topic = normalizeTopic(topic)
+
+	// 创建或获取 channel
 	ch, ok := e.channels.Load(topic)
 	if !ok {
-		ch = newChannel(topic, e.bufferSize, e) // 传入 EventBus 实例
+		ch = newChannel(topic, e.bufferSize, e)
 		e.channels.Store(topic, ch)
 		go ch.(*channel).loop()
 	}
-	return ch.(*channel).publish(payload)
+
+	return ch.(*channel).subscribe(handler)
+}
+
+// Publish 支持通配符的发布
+func (e *EventBus) Publish(topic string, payload any) error {
+	startTime := time.Now()
+	metadata := PublishMetadata{
+		Timestamp: startTime,
+		Async:     true,
+		QueueSize: e.bufferSize,
+	}
+
+	if e.tracer != nil {
+		e.tracer.OnPublish(topic, payload, metadata)
+	}
+
+	// 标准化主题
+	topic = normalizeTopic(topic)
+
+	// 应用过滤器
+	for _, filter := range e.filters {
+		if !filter.Filter(topic, payload) {
+			return nil
+		}
+	}
+
+	// 应用中间件
+	handler := func(topic string, payload any) error {
+		// 查找所有匹配的订阅者
+		e.channels.Range(func(key, value any) bool {
+			pattern := key.(string)
+			if matchTopic(pattern, topic) {
+				if err := value.(*channel).publish(payload); err != nil {
+					if e.tracer != nil {
+						e.tracer.OnError(topic, err)
+					}
+				}
+			}
+			return true
+		})
+		return nil
+	}
+
+	// 包装中间件
+	for i := len(e.middlewares) - 1; i >= 0; i-- {
+		mw := e.middlewares[i]
+		next := handler
+		handler = func(t string, p any) error {
+			// 执行前置处理
+			p = mw.Before(t, p)
+
+			// 执行处理
+			err := next(t, p)
+
+			// 执行后置处理
+			mw.After(t, p)
+
+			return err
+		}
+	}
+
+	// 执行处理链
+	return handler(topic, payload)
 }
 
 // PublishSync sends a message to all subscribers of a topic synchronously
@@ -354,4 +397,21 @@ func (e *EventBus) Unsubscribe(topic string, handler any) error {
 		return ErrNoSubscriber
 	}
 	return ch.(*channel).unsubscribe(handler)
+}
+
+// validateHandler 验证处理器函数的合法性
+func validateHandler(handler any) error {
+	if reflect.TypeOf(handler).Kind() != reflect.Func {
+		return ErrHandlerIsNotFunc
+	}
+
+	typ := reflect.TypeOf(handler)
+	if typ.NumIn() != 2 {
+		return ErrHandlerParamNum
+	}
+	if typ.In(0).Kind() != reflect.String {
+		return ErrHandlerFirstParam
+	}
+
+	return nil
 }
