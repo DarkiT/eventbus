@@ -1,34 +1,50 @@
 package eventbus
 
 import (
+	"context"
 	"fmt"
 	"reflect"
+	"runtime"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	// DefaultBufferSize 是默认的通道缓冲区大小
-	DefaultBufferSize = 512
-	// DefaultTimeout 是发布操作的默认超时时间
+	// DefaultTimeout 默认超时时间
 	DefaultTimeout = 5 * time.Second
-	// slowConsumerThreshold 是慢消费者的阈值
+	// slowConsumerThreshold 慢消费者阈值
 	slowConsumerThreshold = 100 * time.Millisecond
 )
 
-type channel struct {
-	sync.RWMutex
-	bufferSize int
-	topic      string
-	channel    chan any
-	handlers   *_CowMap
-	closed     bool
-	stopCh     chan struct{}
-	timeout    time.Duration
-	eventBus   *EventBus
+// defaultBufferSize 默认缓冲区大小，根据CPU核心数动态设置
+var defaultBufferSize = runtime.NumCPU() * 64
+
+// HandlerInfo 处理器信息，支持优先级
+type HandlerInfo struct {
+	Handler  *reflect.Value
+	Priority int
+	ID       uintptr // 用于唯一标识处理器
 }
 
-// newChannel 创建一个新的 channel，指定主题和缓冲区大小
+// channel 优化后的通道实现
+type channel struct {
+	sync.RWMutex
+	topic      string
+	channel    chan any
+	handlers   []*HandlerInfo // 使用切片替代 map，支持优先级排序
+	closed     atomic.Bool    // 使用原子操作
+	stopCh     chan struct{}
+	eventBus   *EventBus
+	handlerMap map[uintptr]*HandlerInfo // 用于快速查找和删除
+	bufferSize int
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+// newChannel 创建优化后的通道
 func newChannel(topic string, bufferSize int, bus *EventBus) *channel {
 	var ch chan any
 	if bufferSize <= 0 {
@@ -37,65 +53,167 @@ func newChannel(topic string, bufferSize int, bus *EventBus) *channel {
 		ch = make(chan any, bufferSize)
 	}
 
-	return &channel{
-		bufferSize: bufferSize,
+	ctx, cancel := context.WithCancel(context.Background())
+
+	c := &channel{
 		topic:      topic,
 		channel:    ch,
-		handlers:   newCowMap(),
+		handlers:   make([]*HandlerInfo, 0),
+		handlerMap: make(map[uintptr]*HandlerInfo),
 		stopCh:     make(chan struct{}),
-		eventBus:   bus, // 存储 EventBus 引用
+		eventBus:   bus,
+		bufferSize: bufferSize,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
+
+	go c.loop()
+	return c
 }
 
-// transfer 调用所有处理器并传递给定的负载
-func (c *channel) transfer(topic string, payload any) {
-	c.RLock()
-	defer c.RUnlock()
-
-	// 获取所有处理器
-	c.handlers.Range(func(_, value any) bool {
-		if fn, ok := value.(*reflect.Value); ok && fn != nil {
-			// 确保参数不为空
-			topicVal := reflect.ValueOf(topic)
-			payloadVal := reflect.ValueOf(payload)
-			if !topicVal.IsValid() || !payloadVal.IsValid() {
-				return true
-			}
-			fn.Call([]reflect.Value{topicVal, payloadVal})
-		}
-		return true
-	})
-}
-
-// loop 监听通道并用负载调用处理器。 它从通道接收消息，然后遍历处理器映射并调用它们。
+// loop 优化的消息处理循环
 func (c *channel) loop() {
+	defer func() {
+		if r := recover(); r != nil {
+			if c.eventBus.tracer != nil {
+				c.eventBus.tracer.OnError(c.topic, fmt.Errorf("panic in handler: %v", r))
+			}
+		}
+	}()
+
 	for {
 		select {
 		case payload := <-c.channel:
 			c.transfer(c.topic, payload)
+		case <-c.ctx.Done():
+			return
 		case <-c.stopCh:
 			return
 		}
 	}
 }
 
-// subscribe 添加处理器到通道，如果通道已关闭则返回错误
-func (c *channel) subscribe(handler any) error {
+// transfer 优化的消息传递，支持优先级
+func (c *channel) transfer(topic string, payload any) {
 	c.RLock()
-	defer c.RUnlock()
-	if c.closed {
+	handlers := slices.Clone(c.handlers) // 复制切片避免并发问题
+	c.RUnlock()
+
+	startTime := time.Now()
+
+	// 按优先级顺序执行处理器
+	for _, handlerInfo := range handlers {
+		if handlerInfo.Handler != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if c.eventBus.tracer != nil {
+							c.eventBus.tracer.OnError(topic, fmt.Errorf("handler panic: %v", r))
+						}
+					}
+				}()
+
+				topicVal := reflect.ValueOf(topic)
+				payloadVal := reflect.ValueOf(payload)
+				if topicVal.IsValid() && payloadVal.IsValid() {
+					handlerInfo.Handler.Call([]reflect.Value{topicVal, payloadVal})
+				}
+			}()
+		}
+	}
+
+	// 检查处理延迟
+	latency := time.Since(startTime)
+	if latency > slowConsumerThreshold && c.eventBus.tracer != nil {
+		c.eventBus.tracer.OnSlowConsumer(topic, latency)
+	}
+}
+
+// subscribe 添加处理器
+func (c *channel) subscribe(handler any) error {
+	return c.subscribeWithPriority(handler, 0)
+}
+
+// subscribeWithPriority 添加带优先级的处理器
+func (c *channel) subscribeWithPriority(handler any, priority int) error {
+	if c.closed.Load() {
 		return ErrChannelClosed
 	}
+
 	fn := reflect.ValueOf(handler)
-	c.handlers.Store(fn.Pointer(), &fn)
+	if fn.Kind() != reflect.Func {
+		return ErrHandlerIsNotFunc
+	}
+
+	// 验证函数签名
+	typ := fn.Type()
+	if typ.NumIn() != 2 {
+		return ErrHandlerParamNum
+	}
+	if typ.In(0).Kind() != reflect.String {
+		return ErrHandlerFirstParam
+	}
+
+	handlerInfo := &HandlerInfo{
+		Handler:  &fn,
+		Priority: priority,
+		ID:       fn.Pointer(),
+	}
+
+	c.Lock()
+	defer c.Unlock()
+
+	// 添加到映射表
+	c.handlerMap[handlerInfo.ID] = handlerInfo
+
+	// 添加到切片并按优先级排序（优先级高的在前）
+	c.handlers = append(c.handlers, handlerInfo)
+	slices.SortFunc(c.handlers, func(a, b *HandlerInfo) int {
+		return b.Priority - a.Priority // 降序排列
+	})
+
+	if c.eventBus.tracer != nil {
+		c.eventBus.tracer.OnSubscribe(c.topic, handler)
+	}
+
 	return nil
 }
 
-// publishSync 同步触发该通道定义的处理器
+// publishAsync 真正的异步发布
+func (c *channel) publishAsync(payload any) error {
+	if c.closed.Load() {
+		return ErrChannelClosed
+	}
+
+	// 检查队列是否满
+	if c.bufferSize > 0 && len(c.channel) >= c.bufferSize {
+		if c.eventBus.tracer != nil {
+			c.eventBus.tracer.OnQueueFull(c.topic, len(c.channel))
+		}
+	}
+
+	// 对于无缓冲通道，使用超时机制
+	if c.bufferSize <= 0 {
+		select {
+		case c.channel <- payload:
+			return nil
+		case <-time.After(DefaultTimeout):
+			return ErrPublishTimeout
+		}
+	}
+
+	// 对于有缓冲通道，非阻塞发送
+	select {
+	case c.channel <- payload:
+		return nil
+	default:
+		return ErrPublishTimeout
+	}
+}
+
+// publishSync 同步发布
 func (c *channel) publishSync(payload any) error {
-	c.RLock()
-	defer c.RUnlock()
-	if c.closed {
+	if c.closed.Load() {
 		return ErrChannelClosed
 	}
 
@@ -107,81 +225,85 @@ func (c *channel) publishSync(payload any) error {
 	return nil
 }
 
-// publish 异步触发该通道定义的处理器。
-// `payload` 参数将被传递给处理器。
-// 它使用通道异步调用处理器。
-func (c *channel) publish(payload any) error {
-	c.RLock()
-	defer c.RUnlock()
-	if c.closed {
-		return ErrChannelClosed
-	}
-
-	// 检查队列是否满
-	if c.bufferSize > 0 && len(c.channel) >= c.bufferSize {
-		if c.eventBus.tracer != nil {
-			c.eventBus.tracer.OnQueueFull(c.topic, len(c.channel))
-		}
-	}
-
-	startTime := time.Now()
-	c.transfer(c.topic, payload)
-
-	// 检查处理延迟
-	latency := time.Since(startTime)
-	if latency > slowConsumerThreshold && c.eventBus.tracer != nil {
-		c.eventBus.tracer.OnSlowConsumer(c.topic, latency)
-	}
-
-	return nil
-}
-
-// unsubscribe 移除该通道的处理器
+// unsubscribe 移除处理器
 func (c *channel) unsubscribe(handler any) error {
-	c.RLock()
-	defer c.RUnlock()
-	if c.closed {
+	if c.closed.Load() {
 		return ErrChannelClosed
 	}
+
 	fn := reflect.ValueOf(handler)
-	c.handlers.Delete(fn.Pointer())
+	handlerID := fn.Pointer()
+
+	c.Lock()
+	defer c.Unlock()
+
+	// 从映射表中删除
+	if _, exists := c.handlerMap[handlerID]; !exists {
+		return ErrNoSubscriber
+	}
+	delete(c.handlerMap, handlerID)
+
+	// 从切片中删除
+	c.handlers = slices.DeleteFunc(c.handlers, func(h *HandlerInfo) bool {
+		return h.ID == handlerID
+	})
+
+	if c.eventBus.tracer != nil {
+		c.eventBus.tracer.OnUnsubscribe(c.topic, handler)
+	}
+
 	return nil
 }
 
 // close 关闭通道
 func (c *channel) close() {
-	c.Lock()
-	defer c.Unlock()
-
-	if c.closed {
-		return
+	if !c.closed.CompareAndSwap(false, true) {
+		return // 已经关闭
 	}
 
-	c.closed = true
-	close(c.channel)
+	c.cancel() // 取消上下文
 	close(c.stopCh)
-	c.handlers.Clear()
+
+	// 安全关闭通道
+	go func() {
+		time.Sleep(100 * time.Millisecond) // 给处理器一些时间完成
+		close(c.channel)
+	}()
+
+	c.Lock()
+	c.handlers = nil
+	c.handlerMap = nil
+	c.Unlock()
 }
 
-// EventBus 是事件主题的容器。
-// 每个主题对应一个通道。`eventbus.Publish()` 将消息推送到通道，
-// 然后 `eventbus.Subscribe()` 中的处理器会处理通道中的消息。
+// EventBus 优化后的事件总线
 type EventBus struct {
 	bufferSize  int
 	channels    *_CowMap
 	timeout     time.Duration
-	once        sync.Once
 	filters     []EventFilter
 	middlewares []Middleware
 	tracer      EventTracer
 	lock        sync.RWMutex
-	closed      bool
+	closed      atomic.Bool
 }
 
-// New 创建一个无缓冲的 EventBus
-func New() *EventBus {
+// New 创建事件总线
+// 可选参数：bufferSize - 缓冲区大小，不传或传0表示无缓冲，负数使用默认缓冲大小
+func New(bufferSize ...int) *EventBus {
+	size := -1 // 默认无缓冲
+	if len(bufferSize) > 0 {
+		if bufferSize[0] > 0 {
+			size = bufferSize[0]
+		} else if bufferSize[0] == 0 {
+			size = -1 // 显式指定无缓冲
+		} else {
+			size = defaultBufferSize // 负数使用默认缓冲大小
+		}
+	}
+
 	return &EventBus{
-		bufferSize:  -1,
+		bufferSize:  size,
 		channels:    newCowMap(),
 		timeout:     DefaultTimeout,
 		filters:     make([]EventFilter, 0),
@@ -189,274 +311,70 @@ func New() *EventBus {
 	}
 }
 
-// NewBuffered 创建一个有缓冲区大小的 EventBus
-func NewBuffered(bufferSize int) *EventBus {
-	if bufferSize <= 0 {
-		bufferSize = DefaultBufferSize
-	}
-	return &EventBus{
-		bufferSize:  bufferSize,
-		channels:    newCowMap(),
-		timeout:     DefaultTimeout,
-		filters:     make([]EventFilter, 0),
-		middlewares: make([]Middleware, 0),
-	}
-}
-
-// AddFilter 添加事件过滤器
+// AddFilter 添加过滤器
 func (e *EventBus) AddFilter(filter EventFilter) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
 	e.filters = append(e.filters, filter)
 }
 
-// SetTracer 添加事件追踪器
+// SetTracer 设置追踪器
 func (e *EventBus) SetTracer(tracer EventTracer) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
 	e.tracer = tracer
 }
 
 // Use 添加中间件
 func (e *EventBus) Use(middleware Middleware) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
 	e.middlewares = append(e.middlewares, middleware)
 }
 
-// SubscribeWithPriority 为某个主题添加优先级处理器
-func (e *EventBus) SubscribeWithPriority(topic string, handler any, priority int) error {
-	if reflect.TypeOf(handler).Kind() != reflect.Func {
-		return ErrHandlerIsNotFunc
-	}
-
-	ch, ok := e.channels.Load(topic)
-	if !ok {
-		ch = newChannel(topic, e.bufferSize, e)
-		e.channels.Store(topic, ch)
-		go ch.(*channel).loop()
-	}
-	return ch.(*channel).subscribeWithPriority(handler, priority)
-}
-
-// HealthCheck 健康检查
-func (e *EventBus) HealthCheck() error {
-	e.lock.RLock()
-	defer e.lock.RUnlock()
-
-	if e.closed {
-		return ErrChannelClosed
-	}
-	return nil
-}
-
-// Close 关闭 eventbus
-func (e *EventBus) Close() {
-	e.lock.Lock()
-	defer e.lock.Unlock()
-
-	// 设置关闭标志
-	e.closed = true
-
-	// 关闭所有通道
-	e.channels.Range(func(key, value interface{}) bool {
-		ch := value.(*channel)
-		ch.close()
-		return true
-	})
-}
-
-// subscribeWithPriority 添加优先级处理器
-func (c *channel) subscribeWithPriority(handler any, priority int) error {
-	c.RLock()
-	if c.closed {
-		c.RUnlock()
-		return ErrChannelClosed
-	}
-	c.RUnlock()
-
-	fn := reflect.ValueOf(handler)
-	if fn.Kind() != reflect.Func {
-		return ErrHandlerIsNotFunc
-	}
-
-	// 检查函数参数
-	typ := fn.Type()
-	if typ.NumIn() != 2 {
-		return ErrHandlerParamNum
-	}
-	if typ.In(0).Kind() != reflect.String {
-		return ErrHandlerFirstParam
-	}
-
-	sub := &Subscription{
-		Handler:  &fn,
-		Priority: priority,
-	}
-	c.handlers.Store(fn.Pointer(), sub)
-	return nil
-}
-
-// Subscribe 支持通配符的订阅
+// Subscribe 订阅主题
 func (e *EventBus) Subscribe(topic string, handler any) error {
-	e.lock.RLock()
-	if e.closed {
-		e.lock.RUnlock()
+	return e.SubscribeWithPriority(topic, handler, 0)
+}
+
+// SubscribeWithPriority 带优先级订阅
+func (e *EventBus) SubscribeWithPriority(topic string, handler any, priority int) error {
+	if e.closed.Load() {
 		return ErrChannelClosed
 	}
-	e.lock.RUnlock()
 
 	if err := validateHandler(handler); err != nil {
 		return err
 	}
 
-	if e.tracer != nil {
-		e.tracer.OnSubscribe(topic, handler)
-	}
-
-	// 标准化主题
 	topic = normalizeTopic(topic)
 
-	// 创建或获取 channel
+	// 创建或获取通道
 	ch, ok := e.channels.Load(topic)
 	if !ok {
 		ch = newChannel(topic, e.bufferSize, e)
 		e.channels.Store(topic, ch)
-		go ch.(*channel).loop()
 	}
 
-	return ch.(*channel).subscribe(handler)
+	return ch.(*channel).subscribeWithPriority(handler, priority)
 }
 
-// Publish 支持通配符的发布
+// Publish 异步发布消息
 func (e *EventBus) Publish(topic string, payload any) error {
-	e.lock.RLock()
-	if e.closed {
-		e.lock.RUnlock()
+	return e.publishInternal(topic, payload, true)
+}
+
+// PublishSync 同步发布消息
+func (e *EventBus) PublishSync(topic string, payload any) error {
+	return e.publishInternal(topic, payload, false)
+}
+
+// PublishWithContext 带上下文的发布
+func (e *EventBus) PublishWithContext(ctx context.Context, topic string, payload any) error {
+	if e.closed.Load() {
 		return ErrChannelClosed
 	}
-	e.lock.RUnlock()
 
-	startTime := time.Now()
-	metadata := PublishMetadata{
-		Timestamp: startTime,
-		Async:     true,
-		QueueSize: e.bufferSize,
-	}
-
-	if e.tracer != nil {
-		e.tracer.OnPublish(topic, payload, metadata)
-	}
-
-	// 标准化主题
-	topic = normalizeTopic(topic)
-
-	// 应用过滤器
-	for _, filter := range e.filters {
-		if !filter.Filter(topic, payload) {
-			return nil
-		}
-	}
-
-	// 应用中间件
-	handler := func(topic string, payload any) error {
-		// 查找所有匹配的订阅者
-		e.channels.Range(func(key, value any) bool {
-			pattern := key.(string)
-			if matchTopic(pattern, topic) {
-				if err := value.(*channel).publish(payload); err != nil {
-					if e.tracer != nil {
-						e.tracer.OnError(topic, err)
-					}
-				}
-			}
-			return true
-		})
-		return nil
-	}
-
-	// 包装中间件
-	for i := len(e.middlewares) - 1; i >= 0; i-- {
-		mw := e.middlewares[i]
-		next := handler
-		handler = func(t string, p any) error {
-			// 执行前置处理
-			p = mw.Before(t, p)
-
-			// 执行处理
-			err := next(t, p)
-
-			// 执行后置处理
-			mw.After(t, p)
-
-			return err
-		}
-	}
-
-	// 执行处理链
-	return handler(topic, payload)
-}
-
-// PublishSync 同步发送消息到所有订阅者
-func (e *EventBus) PublishSync(topic string, payload any) error {
-	startTime := time.Now()
-	metadata := PublishMetadata{
-		Timestamp: startTime,
-		Async:     false,
-		QueueSize: e.bufferSize,
-	}
-
-	if e.tracer != nil {
-		e.tracer.OnPublish(topic, payload, metadata)
-	}
-
-	// 标准化主题
-	topic = normalizeTopic(topic)
-
-	// 应用过滤器
-	for _, filter := range e.filters {
-		if !filter.Filter(topic, payload) {
-			return nil
-		}
-	}
-
-	// 应用中间件
-	handler := func(topic string, payload any) error {
-		// 查找所有匹配的订阅者
-		var lastErr error
-		e.channels.Range(func(key, value any) bool {
-			pattern := key.(string)
-			if matchTopic(pattern, topic) {
-				if err := value.(*channel).publishSync(payload); err != nil {
-					lastErr = err
-					if e.tracer != nil {
-						e.tracer.OnError(topic, err)
-					}
-				}
-			}
-			return true
-		})
-		return lastErr
-	}
-
-	// 包装中间件
-	for i := len(e.middlewares) - 1; i >= 0; i-- {
-		mw := e.middlewares[i]
-		next := handler
-		handler = func(t string, p any) error {
-			// 执行前置处理
-			p = mw.Before(t, p)
-
-			// 执行处理
-			err := next(t, p)
-
-			// 执行后置处理
-			mw.After(t, p)
-
-			return err
-		}
-	}
-
-	// 执行处理链
-	return handler(topic, payload)
-}
-
-// PublishWithTimeout 添加带超时的发布方法
-func (e *EventBus) PublishWithTimeout(topic string, payload interface{}, timeout time.Duration) error {
 	done := make(chan error, 1)
 	go func() {
 		done <- e.PublishSync(topic, payload)
@@ -465,12 +383,126 @@ func (e *EventBus) PublishWithTimeout(topic string, payload interface{}, timeout
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(timeout):
-		return fmt.Errorf("publish timeout after %v", timeout)
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-// Unsubscribe 移除某个主题的处理器
+// publishInternal 内部发布实现
+func (e *EventBus) publishInternal(topic string, payload any, async bool) error {
+	if e.closed.Load() {
+		return ErrChannelClosed
+	}
+
+	startTime := time.Now()
+	metadata := PublishMetadata{
+		Timestamp: startTime,
+		Async:     async,
+		QueueSize: e.bufferSize,
+	}
+
+	if e.tracer != nil {
+		e.tracer.OnPublish(topic, payload, metadata)
+	}
+
+	topic = normalizeTopic(topic)
+
+	// 应用过滤器
+	e.lock.RLock()
+	filters := slices.Clone(e.filters)
+	middlewares := slices.Clone(e.middlewares)
+	e.lock.RUnlock()
+
+	for _, filter := range filters {
+		if !filter.Filter(topic, payload) {
+			return nil
+		}
+	}
+
+	// 构建处理链
+	handler := func(t string, p any) error {
+		return e.deliverMessage(t, p, async)
+	}
+
+	// 应用中间件（逆序包装）
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		mw := middlewares[i]
+		next := handler
+		handler = func(t string, p any) error {
+			p = mw.Before(t, p)
+			err := next(t, p)
+			mw.After(t, p)
+			return err
+		}
+	}
+
+	return handler(topic, payload)
+}
+
+// deliverMessage 优化的消息投递
+func (e *EventBus) deliverMessage(topic string, payload any, async bool) error {
+	var lastErr error
+	deliveredChannels := make(map[*channel]bool) // 防止重复投递
+
+	// 直接匹配
+	if ch, ok := e.channels.Load(topic); ok {
+		channel := ch.(*channel)
+		deliveredChannels[channel] = true
+
+		if async {
+			if err := channel.publishAsync(payload); err != nil {
+				lastErr = err
+				if e.tracer != nil {
+					e.tracer.OnError(topic, err)
+				}
+			}
+		} else {
+			if err := channel.publishSync(payload); err != nil {
+				lastErr = err
+				if e.tracer != nil {
+					e.tracer.OnError(topic, err)
+				}
+			}
+		}
+	}
+
+	// 通配符匹配 - 遍历所有订阅的模式
+	e.channels.Range(func(key, value any) bool {
+		pattern := key.(string)
+		channel := value.(*channel)
+
+		// 跳过已经直接匹配的通道
+		if deliveredChannels[channel] {
+			return true
+		}
+
+		// 检查是否匹配通配符模式
+		if matchTopic(pattern, topic) {
+			deliveredChannels[channel] = true
+
+			if async {
+				if err := channel.publishAsync(payload); err != nil {
+					lastErr = err
+					if e.tracer != nil {
+						e.tracer.OnError(topic, err)
+					}
+				}
+			} else {
+				if err := channel.publishSync(payload); err != nil {
+					lastErr = err
+					if e.tracer != nil {
+						e.tracer.OnError(topic, err)
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	return lastErr
+}
+
+// Unsubscribe 取消订阅
 func (e *EventBus) Unsubscribe(topic string, handler any) error {
 	if e.tracer != nil {
 		e.tracer.OnUnsubscribe(topic, handler)
@@ -483,17 +515,69 @@ func (e *EventBus) Unsubscribe(topic string, handler any) error {
 	return ch.(*channel).unsubscribe(handler)
 }
 
-// UnsubscribeAll 移除某个主题的所有处理器
+// UnsubscribeAll 取消主题的所有订阅
 func (e *EventBus) UnsubscribeAll(topic string) error {
 	ch, ok := e.channels.Load(topic)
 	if !ok {
 		return ErrNoSubscriber
 	}
-	ch.(*channel).handlers.Clear()
+
+	channel := ch.(*channel)
+	channel.Lock()
+	channel.handlers = nil
+	channel.handlerMap = make(map[uintptr]*HandlerInfo)
+	channel.Unlock()
+
 	return nil
 }
 
-// validateHandler 验证处理器函数的合法性
+// Close 关闭事件总线
+func (e *EventBus) Close() {
+	if !e.closed.CompareAndSwap(false, true) {
+		return
+	}
+
+	// 关闭所有通道
+	e.channels.Range(func(key, value interface{}) bool {
+		ch := value.(*channel)
+		ch.close()
+		return true
+	})
+}
+
+// HealthCheck 健康检查
+func (e *EventBus) HealthCheck() error {
+	if e.closed.Load() {
+		return ErrChannelClosed
+	}
+	return nil
+}
+
+// GetStats 获取统计信息
+func (e *EventBus) GetStats() map[string]interface{} {
+	stats := make(map[string]interface{})
+
+	channelCount := e.channels.Len()
+	stats["channel_count"] = channelCount
+	stats["buffer_size"] = e.bufferSize
+	stats["timeout"] = e.timeout
+	stats["closed"] = e.closed.Load()
+
+	return stats
+}
+
+// 辅助函数
+func splitTopic(topic string) []string {
+	if topic == "" {
+		return []string{}
+	}
+	return strings.Split(topic, ".")
+}
+
+func joinTopic(parts []string) string {
+	return strings.Join(parts, ".")
+}
+
 func validateHandler(handler any) error {
 	if reflect.TypeOf(handler).Kind() != reflect.Func {
 		return ErrHandlerIsNotFunc

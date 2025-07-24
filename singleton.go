@@ -1,58 +1,97 @@
 package eventbus
 
-import "time"
+import (
+	"context"
+	"sync"
+)
 
-// singleton 是一个指向无缓冲 EventBus 实例的指针，该实例将在必要时创建。
-var singleton *EventBus
+// singleton 全局单例实例
+var (
+	singleton *EventBus
+	once      sync.Once
+	mu        sync.RWMutex
+)
 
-func init() {
-	ResetSingleton()
+// getSingleton 获取单例实例，使用懒加载
+func getSingleton() *EventBus {
+	once.Do(func() {
+		singleton = New(defaultBufferSize)
+	})
+	return singleton
 }
 
-// ResetSingleton 重置单例对象。如果单例对象不为 nil，
-// 它会首先关闭旧的单例对象，然后创建一个新的单例实例。
+// ResetSingleton 重置单例对象，主要用于测试
 func ResetSingleton() {
+	mu.Lock()
+	defer mu.Unlock()
+
 	if singleton != nil {
 		singleton.Close()
 	}
-	singleton = New()
+
+	// 重置 once，允许重新创建
+	once = sync.Once{}
+	singleton = nil
 }
 
-// Unsubscribe 从一个主题中移除已定义的处理器。
-// 如果该主题没有订阅者，返回错误。
-func Unsubscribe(topic string, handler any) error {
-	return singleton.Unsubscribe(topic, handler)
-}
-
-// Subscribe 订阅一个主题，如果处理器不是函数则返回错误。
-// 处理器必须有两个参数：第一个参数必须是字符串，
-// 第二个参数的类型必须与 `Publish()` 中的 payload 类型一致。
+// Subscribe 订阅主题，使用全局单例
 func Subscribe(topic string, handler any) error {
-	return singleton.Subscribe(topic, handler)
+	return getSingleton().Subscribe(topic, handler)
 }
 
-// Publish 触发为某个主题定义的处理器。`payload` 参数将传递给处理器。
-// payload 的类型必须与 `Subscribe()` 中处理器的第二个参数类型一致。
+// SubscribeWithPriority 带优先级订阅主题，使用全局单例
+func SubscribeWithPriority(topic string, handler any, priority int) error {
+	return getSingleton().SubscribeWithPriority(topic, handler, priority)
+}
+
+// Unsubscribe 取消订阅主题，使用全局单例
+func Unsubscribe(topic string, handler any) error {
+	return getSingleton().Unsubscribe(topic, handler)
+}
+
+// Publish 异步发布消息，使用全局单例
 func Publish(topic string, payload any) error {
-	return singleton.Publish(topic, payload)
+	return getSingleton().Publish(topic, payload)
 }
 
-// PublishSync 是 Publish 的同步版本，它会触发为某个主题定义的处理器，并使用给定的 payload。
-// payload 的类型必须与 `Subscribe()` 中处理器的第二个参数类型一致。
+// PublishSync 同步发布消息，使用全局单例
 func PublishSync(topic string, payload any) error {
-	return singleton.Publish(topic, payload)
+	return getSingleton().PublishSync(topic, payload)
 }
 
-// PublishWithTimeout 添加带超时的发布方法
-// payload 的类型必须与 `Subscribe()` 中处理器的第二个参数类型一致。
-func PublishWithTimeout(topic string, payload interface{}, timeout time.Duration) error {
-	return singleton.PublishWithTimeout(topic, payload, timeout)
+// PublishWithContext 带上下文发布消息，使用全局单例
+func PublishWithContext(ctx context.Context, topic string, payload any) error {
+	return getSingleton().PublishWithContext(ctx, topic, payload)
 }
 
-// Close 关闭 EventBus 的单例实例。
+// AddFilter 添加过滤器，使用全局单例
+func AddFilter(filter EventFilter) {
+	getSingleton().AddFilter(filter)
+}
+
+// SetTracer 设置追踪器，使用全局单例
+func SetTracer(tracer EventTracer) {
+	getSingleton().SetTracer(tracer)
+}
+
+// Use 添加中间件，使用全局单例
+func Use(middleware Middleware) {
+	getSingleton().Use(middleware)
+}
+
+// Close 关闭全局单例
 func Close() {
+	mu.Lock()
+	defer mu.Unlock()
+
 	if singleton != nil {
 		singleton.Close()
 		singleton = nil
+		once = sync.Once{} // 重置 once，允许重新创建
 	}
+}
+
+// HealthCheck 健康检查，使用全局单例
+func HealthCheck() error {
+	return getSingleton().HealthCheck()
 }
