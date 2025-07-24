@@ -1,6 +1,7 @@
 package eventbus
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -13,8 +14,11 @@ func TestTopicGroup(t *testing.T) {
 
 	// 测试基本的组发布/订阅
 	var received string
+	var mu sync.RWMutex
 	handler := func(_ string, msg string) {
+		mu.Lock()
 		received = msg
+		mu.Unlock()
 	}
 
 	err := group.Subscribe("room1", handler)
@@ -23,7 +27,11 @@ func TestTopicGroup(t *testing.T) {
 	err = group.Publish("room1", "Hello")
 	assert.NoError(t, err)
 	time.Sleep(time.Millisecond)
-	assert.Equal(t, "Hello", received)
+
+	mu.RLock()
+	result := received
+	mu.RUnlock()
+	assert.Equal(t, "Hello", result)
 
 	// 测试取消订阅
 	err = group.Unsubscribe("room1", handler)
@@ -55,8 +63,11 @@ func TestWildcardMatching(t *testing.T) {
 func TestTopicSeparators(t *testing.T) {
 	bus := New()
 	var received string
+	var mu sync.RWMutex
 	handler := func(_ string, msg string) {
+		mu.Lock()
 		received = msg
+		mu.Unlock()
 	}
 
 	// 使用不同的分隔符订阅
@@ -75,11 +86,18 @@ func TestTopicSeparators(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			mu.Lock()
 			received = ""
+			mu.Unlock()
+
 			err := bus.Publish(tt.topic, "Hello")
 			assert.NoError(t, err)
 			time.Sleep(time.Millisecond)
-			assert.Equal(t, "Hello", received)
+
+			mu.RLock()
+			result := received
+			mu.RUnlock()
+			assert.Equal(t, "Hello", result)
 		})
 	}
 }
@@ -90,11 +108,16 @@ func TestMultipleGroups(t *testing.T) {
 	newsGroup := bus.NewGroup("news")
 
 	var chatMsg, newsMsg string
+	var mu sync.RWMutex
 	chatHandler := func(_ string, msg string) {
+		mu.Lock()
 		chatMsg = msg
+		mu.Unlock()
 	}
 	newsHandler := func(_ string, msg string) {
+		mu.Lock()
 		newsMsg = msg
+		mu.Unlock()
 	}
 
 	// 订阅不同组的主题
@@ -110,15 +133,24 @@ func TestMultipleGroups(t *testing.T) {
 	assert.NoError(t, err)
 
 	time.Sleep(time.Millisecond)
-	assert.Equal(t, "Chat Message", chatMsg)
-	assert.Equal(t, "News Message", newsMsg)
+
+	mu.RLock()
+	chatResult := chatMsg
+	newsResult := newsMsg
+	mu.RUnlock()
+
+	assert.Equal(t, "Chat Message", chatResult)
+	assert.Equal(t, "News Message", newsResult)
 }
 
 func TestWildcardSubscriptions(t *testing.T) {
 	bus := New()
 	var messages []string
+	var mu sync.Mutex
 	handler := func(_ string, msg string) {
+		mu.Lock()
 		messages = append(messages, msg)
+		mu.Unlock()
 	}
 
 	// 订阅使用通配符的主题
@@ -138,8 +170,14 @@ func TestWildcardSubscriptions(t *testing.T) {
 	}
 
 	time.Sleep(time.Millisecond)
-	assert.Equal(t, len(topics), len(messages))
+
+	mu.Lock()
+	messagesCopy := make([]string, len(messages))
+	copy(messagesCopy, messages)
+	mu.Unlock()
+
+	assert.Equal(t, len(topics), len(messagesCopy))
 	for i, topic := range topics {
-		assert.Equal(t, topic, messages[i])
+		assert.Equal(t, topic, messagesCopy[i])
 	}
 }

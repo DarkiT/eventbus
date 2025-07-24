@@ -23,6 +23,12 @@ var (
 
 	// ErrPublishTimeout 当发布操作超时时返回
 	ErrPublishTimeout = errors.New("publish operation timed out")
+
+	// ErrInvalidTopic 当主题格式无效时返回
+	ErrInvalidTopic = errors.New("invalid topic format")
+
+	// ErrEventBusClosed 当事件总线已关闭时返回
+	ErrEventBusClosed = errors.New("event bus is closed")
 )
 
 // WrapError 用附加的上下文信息包装错误

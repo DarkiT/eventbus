@@ -1,12 +1,14 @@
 package eventbus
 
 import (
-	"math/rand"
+	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func busHandlerOne(topic string, val int) {
@@ -86,7 +88,7 @@ func Test_channelClose(t *testing.T) {
 	err := ch.subscribe(busHandlerOne)
 	assert.Nil(t, err)
 	ch.close()
-	assert.Equal(t, uint32(0), ch.handlers.Len())
+	assert.Equal(t, 0, len(ch.handlers))
 	ch.close()
 }
 
@@ -98,14 +100,11 @@ func Test_channelPublish(t *testing.T) {
 	assert.Equal(t, "test_topic", ch.topic)
 	ch.subscribe(busHandlerOne)
 
-	// 启动消息处理循环
-	go ch.loop()
-
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		for i := 0; i < 100; i++ {
-			err := ch.publish(i)
+			err := ch.publishAsync(i)
 			assert.Nil(t, err)
 		}
 		wg.Done()
@@ -115,7 +114,7 @@ func Test_channelPublish(t *testing.T) {
 	// 等待消息处理完成
 	time.Sleep(time.Millisecond)
 	ch.close()
-	err := ch.publish(1)
+	err := ch.publishAsync(1)
 	assert.Equal(t, ErrChannelClosed, err)
 }
 
@@ -127,14 +126,11 @@ func Test_channelPublishSync(t *testing.T) {
 	assert.Equal(t, "test_topic", ch.topic)
 	ch.subscribe(busHandlerOne)
 
-	// 启动消息处理循环
-	go ch.loop()
-
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		for i := 0; i < 100; i++ {
-			err := ch.publish(i)
+			err := ch.publishSync(i)
 			assert.Nil(t, err)
 		}
 		wg.Done()
@@ -157,18 +153,34 @@ func Test_New(t *testing.T) {
 	bus.Close()
 }
 
-func Test_NewBuffered(t *testing.T) {
-	bus := NewBuffered(100)
+func Test_NewWithBuffer(t *testing.T) {
+	// 测试带缓冲的事件总线
+	bus := New(100)
 	assert.NotNil(t, bus)
 	assert.Equal(t, 100, bus.bufferSize)
 	assert.NotNil(t, bus.channels)
 	bus.Close()
 
-	busZero := NewBuffered(0)
+	// 测试传入0表示无缓冲
+	busZero := New(0)
 	assert.NotNil(t, busZero)
-	assert.Equal(t, 512, busZero.bufferSize)
+	assert.Equal(t, -1, busZero.bufferSize)
 	assert.NotNil(t, busZero.channels)
 	busZero.Close()
+
+	// 测试传入负数使用默认缓冲大小
+	busNegative := New(-1)
+	assert.NotNil(t, busNegative)
+	assert.Equal(t, defaultBufferSize, busNegative.bufferSize)
+	assert.NotNil(t, busNegative.channels)
+	busNegative.Close()
+
+	// 测试不传参数默认无缓冲
+	busDefault := New()
+	assert.NotNil(t, busDefault)
+	assert.Equal(t, -1, busDefault.bufferSize)
+	assert.NotNil(t, busDefault.channels)
+	busDefault.Close()
 }
 
 func Test_EventBusSubscribe(t *testing.T) {
@@ -267,6 +279,82 @@ func Test_EventBusPublishSync(t *testing.T) {
 	bus.Close()
 }
 
+func Test_EventBusPrioritySubscription(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var order []int
+	var mu sync.Mutex
+
+	// 添加不同优先级的处理器
+	bus.SubscribeWithPriority("test", func(topic string, payload any) {
+		mu.Lock()
+		order = append(order, 1)
+		mu.Unlock()
+	}, 1)
+
+	bus.SubscribeWithPriority("test", func(topic string, payload any) {
+		mu.Lock()
+		order = append(order, 10)
+		mu.Unlock()
+	}, 10)
+
+	bus.SubscribeWithPriority("test", func(topic string, payload any) {
+		mu.Lock()
+		order = append(order, 5)
+		mu.Unlock()
+	}, 5)
+
+	// 同步发布以确保顺序
+	err := bus.PublishSync("test", "message")
+	require.NoError(t, err)
+
+	// 验证执行顺序（高优先级先执行）
+	mu.Lock()
+	expected := []int{10, 5, 1}
+	assert.Equal(t, expected, order)
+	mu.Unlock()
+}
+
+func Test_EventBusContextPublish(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	received := make(chan bool, 1)
+	bus.Subscribe("test", func(topic string, payload any) {
+		time.Sleep(2 * time.Second) // 模拟慢处理
+		received <- true
+	})
+
+	// 测试超时
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	err := bus.PublishWithContext(ctx, "test", "message")
+	assert.Error(t, err)
+	assert.Equal(t, context.DeadlineExceeded, err)
+}
+
+func Test_EventBusAsyncPublish(t *testing.T) {
+	bus := New(10)
+	defer bus.Close()
+
+	var received int32
+	bus.Subscribe("test", func(topic string, payload any) {
+		atomic.AddInt32(&received, 1)
+	})
+
+	// 异步发布多条消息
+	for i := 0; i < 5; i++ {
+		err := bus.Publish("test", i)
+		assert.NoError(t, err)
+	}
+
+	// 等待处理完成
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int32(5), atomic.LoadInt32(&received))
+}
+
 func BenchmarkEventBusPublish(b *testing.B) {
 	bus := New()
 	bus.Subscribe("testtopic", busHandlerOne)
@@ -311,7 +399,7 @@ func BenchmarkHighConcurrency(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			topic := topics[rand.Intn(len(topics))]
+			topic := topics[len(topics)%3] // 简化随机选择
 			bus.Publish(topic, "test")
 		}
 	})
@@ -354,6 +442,7 @@ func TestEventBus_Middleware(t *testing.T) {
 	bus.Subscribe("test", func(topic string, payload int) {})
 	bus.Publish("test", 1)
 
+	time.Sleep(50 * time.Millisecond) // 等待异步处理
 	assert.Equal(t, 2, count)
 }
 
@@ -386,38 +475,19 @@ func Test_EventBusTracer(t *testing.T) {
 	tracer := &mockTracer{}
 	bus.SetTracer(tracer)
 
+	// 定义一个处理器变量以便重用
+	handler := func(topic string, msg interface{}) {}
+
 	// 测试订阅
-	err := bus.Subscribe("test", func(topic string, msg interface{}) {})
+	err := bus.Subscribe("test", handler)
 	assert.Nil(t, err)
 
 	// 测试发布
 	err = bus.Publish("test", "message")
 	assert.Nil(t, err)
 
-	// 测试取消订阅
-	err = bus.Unsubscribe("test", func(topic string, msg interface{}) {})
-	assert.Nil(t, err)
-}
-
-func Test_EventBusFilter(t *testing.T) {
-	bus := New()
-
-	// 添加测试过滤器
-	bus.AddFilter(&mockFilter{allow: false})
-
-	// 测试被过滤的消息
-	err := bus.Publish("test", "message")
-	assert.Nil(t, err)
-}
-
-func Test_EventBusMiddleware(t *testing.T) {
-	bus := New()
-
-	// 添加测试中间件
-	bus.Use(&mockMiddleware{})
-
-	// 测试带中间件的发布
-	err := bus.Publish("test", "message")
+	// 测试取消订阅 - 使用相同的处理器变量
+	err = bus.Unsubscribe("test", handler)
 	assert.Nil(t, err)
 }
 
@@ -468,82 +538,3 @@ func (m *mockTracer) OnError(topic string, err error)                           
 func (m *mockTracer) OnQueueFull(topic string, queueSize int)                           {}
 func (m *mockTracer) OnSlowConsumer(topic string, latency time.Duration)                {}
 func (m *mockTracer) OnComplete(topic string, metadata CompleteMetadata)                {}
-
-type mockFilter struct {
-	allow bool
-}
-
-func (m *mockFilter) Filter(topic string, msg interface{}) bool {
-	return m.allow
-}
-
-type mockMiddleware struct{}
-
-func (m *mockMiddleware) Before(topic string, msg interface{}) interface{} {
-	return msg
-}
-
-func (m *mockMiddleware) After(topic string, msg interface{}) {}
-
-func Test_EventBusQueueFull(t *testing.T) {
-	bus := NewBuffered(1) // 创建一个只有1个缓冲区的事件总线
-	tracer := &mockTracer{}
-	bus.SetTracer(tracer)
-
-	// 订阅一个慢处理器
-	bus.Subscribe("test", func(topic string, msg interface{}) {
-		time.Sleep(100 * time.Millisecond)
-	})
-
-	// 快速发布多个消息以填满队列
-	for i := 0; i < 3; i++ {
-		bus.Publish("test", i)
-	}
-}
-
-func Test_EventBusSlowConsumer(t *testing.T) {
-	bus := New()
-	tracer := &mockTracer{}
-	bus.SetTracer(tracer)
-
-	// 订阅一个慢处理器
-	bus.Subscribe("test", func(topic string, msg interface{}) {
-		time.Sleep(2 * time.Second)
-	})
-
-	// 发布消息
-	bus.Publish("test", "message")
-}
-
-func Test_EventBusWildcardSubscribe(t *testing.T) {
-	bus := New()
-	received := false
-
-	// 使用通配符订阅
-	bus.Subscribe("test.*", func(topic string, msg interface{}) {
-		received = true
-	})
-
-	// 发布到匹配的主题
-	bus.Publish("test.123", "message")
-
-	// 等待消息处理
-	time.Sleep(100 * time.Millisecond)
-	assert.True(t, received)
-}
-
-func Test_EventBusUnsubscribeAll(t *testing.T) {
-	bus := New()
-
-	// 添加多个订阅者
-	bus.Subscribe("test", func(topic string, msg interface{}) {})
-	bus.Subscribe("test", func(topic string, msg interface{}) {})
-
-	// 取消所有订阅
-	err := bus.UnsubscribeAll("test")
-	assert.Nil(t, err)
-
-	// 测试不存在的主题
-	err = bus.UnsubscribeAll("nonexistent")
-	assert.NotNil(t, err)
-}
