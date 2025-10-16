@@ -102,8 +102,16 @@ func (m *MetricsTracer) OnSubscribe(topic string, handler any) {
 
 // OnUnsubscribe 在取消订阅时调用
 func (m *MetricsTracer) OnUnsubscribe(topic string, handler any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if counter, ok := m.subscriberCount[topic]; ok {
-		counter.Add(-1)
+		newVal := counter.Add(-1)
+		if newVal < 0 {
+			counter.Store(0)
+		}
+		if newVal <= 0 {
+			delete(m.subscriberCount, topic)
+		}
 	}
 }
 
@@ -183,17 +191,28 @@ func (m *MetricsTracer) OnSlowConsumer(topic string, latency time.Duration) {
 
 // GetMetrics 获取当前指标
 func (m *MetricsTracer) GetMetrics() map[string]interface{} {
-	return map[string]interface{}{
-		"message_count":    m.messageCount.Load(),
-		"error_count":      m.errorCount.Load(),
-		"processing_time":  time.Duration(m.processingTime.Load()),
-		"subscriber_count": m.subscriberCount,
+	metrics := map[string]interface{}{
+		"message_count":   m.messageCount.Load(),
+		"error_count":     m.errorCount.Load(),
+		"processing_time": time.Duration(m.processingTime.Load()),
 	}
+
+	m.mu.RLock()
+	subscriberSnapshot := make(map[string]int32, len(m.subscriberCount))
+	for topic, counter := range m.subscriberCount {
+		subscriberSnapshot[topic] = counter.Load()
+	}
+	m.mu.RUnlock()
+	metrics["subscriber_count"] = subscriberSnapshot
+
+	return metrics
 }
 
 // GetQueueMetrics 获取队列指标
 func (m *MetricsTracer) GetQueueMetrics() map[string]map[string]int64 {
-	metrics := make(map[string]map[string]int64)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	metrics := make(map[string]map[string]int64, len(m.queueStats))
 	for topic, stats := range m.queueStats {
 		metrics[topic] = map[string]int64{
 			"max_size":     stats.maxSize.Load(),
@@ -207,7 +226,9 @@ func (m *MetricsTracer) GetQueueMetrics() map[string]map[string]int64 {
 
 // GetLatencyMetrics 获取延迟指标
 func (m *MetricsTracer) GetLatencyMetrics() map[string]map[string]interface{} {
-	metrics := make(map[string]map[string]interface{})
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	metrics := make(map[string]map[string]interface{}, len(m.latencyStats))
 	for topic, stats := range m.latencyStats {
 		sampleCount := stats.sampleCount.Load()
 		if sampleCount == 0 {

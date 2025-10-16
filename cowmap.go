@@ -1,47 +1,85 @@
 package eventbus
 
 import (
+	"maps"
+	"reflect"
 	"sync"
 	"sync/atomic"
 )
 
-// _CowMap 实现了一个线程安全的映射，使用的是写时复制（Copy-on-Write）模式
-type _CowMap struct {
-	mu    sync.RWMutex
-	items atomic.Value
+// cowMap 实现了一个线程安全的映射，使用的是写时复制（Copy-on-Write）模式
+// 优化版本：减少内存分配，提升写操作性能
+type cowMap struct {
+	mu      sync.RWMutex
+	items   atomic.Value
+	size    int32 // 使用原子操作的大小计数
+	initial int   // 初始容量
 }
 
-// newCowMap 创建一个新的 _CowMap 实例
-func newCowMap() *_CowMap {
-	cm := &_CowMap{}
-	cm.items.Store(make(map[interface{}]interface{}))
+// newCowMap 创建一个新的 cowMap 实例
+func newCowMap() *cowMap {
+	cm := &cowMap{
+		initial: 16,
+		size:    0,
+	}
+	cm.items.Store(make(map[interface{}]interface{}, cm.initial))
 	return cm
 }
 
 // Store 向 map 中添加或更新一个项
-func (c *_CowMap) Store(key, value interface{}) {
+// 优化版本：智能容量管理，减少不必要的复制
+func (c *cowMap) Store(key, value interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	oldMap := c.items.Load().(map[interface{}]interface{})
-	newMap := make(map[interface{}]interface{}, len(oldMap)+1)
 
-	for k, v := range oldMap {
-		newMap[k] = v
+	// 检查是否是更新操作
+	oldValue, exists := oldMap[key]
+	if exists {
+		// 更新操作：检查值是否相同，避免不必要的复制
+		if valuesEqual(oldValue, value) {
+			return // 值相同，无需操作
+		}
 	}
+
+	newMap := maps.Clone(oldMap)
 	newMap[key] = value
 	c.items.Store(newMap)
+	if !exists {
+		atomic.AddInt32(&c.size, 1)
+	}
+}
+
+// valuesEqual 判断两个值是否相等，兼容不可比较类型
+func valuesEqual(a, b interface{}) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	ta := reflect.TypeOf(a)
+	tb := reflect.TypeOf(b)
+	if ta != tb {
+		return false
+	}
+
+	if ta.Comparable() {
+		return reflect.ValueOf(a).Interface() == reflect.ValueOf(b).Interface()
+	}
+
+	return reflect.DeepEqual(a, b)
 }
 
 // Load 从 map 中获取一个项
-func (c *_CowMap) Load(key interface{}) (value interface{}, ok bool) {
+func (c *cowMap) Load(key interface{}) (value interface{}, ok bool) {
 	currentMap := c.items.Load().(map[interface{}]interface{})
 	value, ok = currentMap[key]
-	return
+	return value, ok
 }
 
 // Delete 从 map 中删除一个项
-func (c *_CowMap) Delete(key interface{}) {
+// 优化版本：智能容量管理
+func (c *cowMap) Delete(key interface{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -50,17 +88,21 @@ func (c *_CowMap) Delete(key interface{}) {
 		return
 	}
 
-	newMap := make(map[interface{}]interface{}, len(oldMap)-1)
-	for k, v := range oldMap {
-		if k != key {
-			newMap[k] = v
-		}
+	// 更新大小计数
+	atomic.AddInt32(&c.size, -1)
+
+	if len(oldMap) == 1 {
+		c.items.Store(make(map[interface{}]interface{}, c.initial))
+		return
 	}
+
+	newMap := maps.Clone(oldMap)
+	delete(newMap, key)
 	c.items.Store(newMap)
 }
 
 // Range 遍历 map 中的项
-func (c *_CowMap) Range(f func(key, value interface{}) bool) {
+func (c *cowMap) Range(f func(key, value interface{}) bool) {
 	currentMap := c.items.Load().(map[interface{}]interface{})
 	for k, v := range currentMap {
 		if !f(k, v) {
@@ -70,14 +112,15 @@ func (c *_CowMap) Range(f func(key, value interface{}) bool) {
 }
 
 // Len 返回 map 中项的数量
-func (c *_CowMap) Len() uint32 {
-	currentMap := c.items.Load().(map[interface{}]interface{})
-	return uint32(len(currentMap))
+// 优化版本：使用原子操作获取大小，避免访问map
+func (c *cowMap) Len() uint32 {
+	return uint32(atomic.LoadInt32(&c.size))
 }
 
 // Clear 移除 map 中的所有项
-func (c *_CowMap) Clear() {
+func (c *cowMap) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.items.Store(make(map[interface{}]interface{}))
+	atomic.StoreInt32(&c.size, 0)
+	c.items.Store(make(map[interface{}]interface{}, c.initial))
 }

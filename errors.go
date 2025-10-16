@@ -15,6 +15,15 @@ var (
 	// ErrHandlerFirstParam 当处理器的第一个参数不是字符串时返回
 	ErrHandlerFirstParam = errors.New("handler's first parameter must be string")
 
+	// ErrHandlerReturnNum 当普通处理器返回值数量非法时返回
+	ErrHandlerReturnNum = errors.New("handler must not return values")
+
+	// ErrResponseReturnNum 当响应式处理器返回值数量非法时返回
+	ErrResponseReturnNum = errors.New("response handler must return (any, error)")
+
+	// ErrResponseReturnType 当响应式处理器第二个返回值不是 error 时返回
+	ErrResponseReturnType = errors.New("response handler second return value must be error")
+
 	// ErrNoSubscriber 当某个主题没有订阅者时返回
 	ErrNoSubscriber = errors.New("no subscriber found for topic")
 
