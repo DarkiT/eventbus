@@ -11,6 +11,12 @@ import (
 	"github.com/darkit/eventbus"
 )
 
+func must(err error) {
+	if err != nil {
+		log.Fatalf("操作失败: %v", err)
+	}
+}
+
 // 用户事件结构
 type UserEvent struct {
 	UserID   string                 `json:"user_id"`
@@ -35,22 +41,22 @@ type Message struct {
 }
 
 // 增强型追踪器 - 结合了基础追踪和统计功能
-type EnhancedTracer struct {
+type Tracer struct {
 	mu      sync.RWMutex
 	events  []string
 	errors  []error
 	metrics map[string]int64
 }
 
-func NewEnhancedTracer() *EnhancedTracer {
-	return &EnhancedTracer{
+func NewTracer() *Tracer {
+	return &Tracer{
 		events:  make([]string, 0),
 		errors:  make([]error, 0),
 		metrics: make(map[string]int64),
 	}
 }
 
-func (t *EnhancedTracer) OnPublish(topic string, payload any, metadata eventbus.PublishMetadata) {
+func (t *Tracer) OnPublish(topic string, payload any, metadata eventbus.PublishMetadata) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.events = append(t.events, fmt.Sprintf("发布: %s (异步: %v, 队列大小: %d)",
@@ -63,7 +69,7 @@ func (t *EnhancedTracer) OnPublish(topic string, payload any, metadata eventbus.
 	}
 }
 
-func (t *EnhancedTracer) OnSubscribe(topic string, handler any) {
+func (t *Tracer) OnSubscribe(topic string, handler any) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.events = append(t.events, fmt.Sprintf("订阅: %s", topic))
@@ -71,7 +77,7 @@ func (t *EnhancedTracer) OnSubscribe(topic string, handler any) {
 	log.Printf("[追踪器] 订阅事件: topic=%s", topic)
 }
 
-func (t *EnhancedTracer) OnUnsubscribe(topic string, handler any) {
+func (t *Tracer) OnUnsubscribe(topic string, handler any) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.events = append(t.events, fmt.Sprintf("取消订阅: %s", topic))
@@ -79,7 +85,7 @@ func (t *EnhancedTracer) OnUnsubscribe(topic string, handler any) {
 	log.Printf("[追踪器] 取消订阅: topic=%s", topic)
 }
 
-func (t *EnhancedTracer) OnError(topic string, err error) {
+func (t *Tracer) OnError(topic string, err error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.errors = append(t.errors, err)
@@ -87,28 +93,28 @@ func (t *EnhancedTracer) OnError(topic string, err error) {
 	log.Printf("[追踪器] 错误 [%s]: %v", topic, err)
 }
 
-func (t *EnhancedTracer) OnComplete(topic string, metadata eventbus.CompleteMetadata) {
+func (t *Tracer) OnComplete(topic string, metadata eventbus.CompleteMetadata) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.metrics["complete_count"]++
 	log.Printf("[追踪器] 完成处理: topic=%s, 处理时间=%v", topic, metadata.ProcessingTime)
 }
 
-func (t *EnhancedTracer) OnQueueFull(topic string, size int) {
+func (t *Tracer) OnQueueFull(topic string, size int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.metrics["queue_full_count"]++
 	log.Printf("[追踪器] 队列满 [%s]: 大小 %d", topic, size)
 }
 
-func (t *EnhancedTracer) OnSlowConsumer(topic string, latency time.Duration) {
+func (t *Tracer) OnSlowConsumer(topic string, latency time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.metrics["slow_consumer_count"]++
 	log.Printf("[追踪器] 慢消费者 [%s]: 延迟 %v", topic, latency)
 }
 
-func (t *EnhancedTracer) GetStats() map[string]interface{} {
+func (t *Tracer) GetStats() map[string]interface{} {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -180,7 +186,7 @@ func (f *SmartFilter) Filter(topic string, payload any) bool {
 }
 
 // 增强型中间件 - 结合性能监控和日志记录
-type EnhancedMiddleware struct {
+type Middleware struct {
 	mu    sync.RWMutex
 	stats map[string]*PerformanceStats
 }
@@ -193,13 +199,13 @@ type PerformanceStats struct {
 	LastUpdated time.Time
 }
 
-func NewEnhancedMiddleware() *EnhancedMiddleware {
-	return &EnhancedMiddleware{
+func NewMiddleware() *Middleware {
+	return &Middleware{
 		stats: make(map[string]*PerformanceStats),
 	}
 }
 
-func (m *EnhancedMiddleware) Before(topic string, payload any) any {
+func (m *Middleware) Before(topic string, payload any) any {
 	// 只在非性能测试主题时输出日志
 	if topic != "performance.test" {
 		log.Printf("[中间件] 开始处理: topic=%s", topic)
@@ -218,7 +224,7 @@ func (m *EnhancedMiddleware) Before(topic string, payload any) any {
 	}
 }
 
-func (m *EnhancedMiddleware) After(topic string, payload any) {
+func (m *Middleware) After(topic string, payload any) {
 	// 只在非性能测试主题时输出日志
 	if topic != "performance.test" {
 		log.Printf("[中间件] 完成处理: topic=%s", topic)
@@ -235,7 +241,7 @@ func (m *EnhancedMiddleware) After(topic string, payload any) {
 	}
 }
 
-func (m *EnhancedMiddleware) updateStats(topic string, duration time.Duration) {
+func (m *Middleware) updateStats(topic string, duration time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -260,7 +266,7 @@ func (m *EnhancedMiddleware) updateStats(topic string, duration time.Duration) {
 	}
 }
 
-func (m *EnhancedMiddleware) GetStats() map[string]*PerformanceStats {
+func (m *Middleware) GetStats() map[string]*PerformanceStats {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -285,7 +291,7 @@ func main() {
 	defer bus.Close()
 
 	// 2. 设置增强型追踪器（减少日志输出）
-	tracer := NewEnhancedTracer()
+	tracer := NewTracer()
 	bus.SetTracer(tracer)
 
 	// 3. 设置智能过滤器
@@ -295,26 +301,26 @@ func main() {
 	bus.AddFilter(smartFilter)
 
 	// 4. 设置增强型中间件（减少日志输出）
-	middleware := NewEnhancedMiddleware()
+	middleware := NewMiddleware()
 	bus.Use(middleware)
 
 	// 5. 演示优先级订阅
 	fmt.Println("\n--- 优先级订阅演示 ---")
 
 	// 低优先级处理器
-	bus.SubscribeWithPriority("user.login", func(topic string, payload any) {
+	must(bus.SubscribeWithPriority("user.login", func(topic string, payload any) {
 		fmt.Println("🔵 低优先级: 记录用户登录日志")
-	}, 1)
+	}, 1))
 
 	// 高优先级处理器
-	bus.SubscribeWithPriority("user.login", func(topic string, payload any) {
+	must(bus.SubscribeWithPriority("user.login", func(topic string, payload any) {
 		fmt.Println("🔴 高优先级: 验证用户权限")
-	}, 10)
+	}, 10))
 
 	// 中等优先级处理器
-	bus.SubscribeWithPriority("user.login", func(topic string, payload any) {
+	must(bus.SubscribeWithPriority("user.login", func(topic string, payload any) {
 		fmt.Println("🟡 中等优先级: 更新用户状态")
-	}, 5)
+	}, 5))
 
 	// 发布登录事件
 	loginEvent := UserEvent{
@@ -327,9 +333,9 @@ func main() {
 		},
 	}
 
-	bus.PublishSync("user.login", map[string]interface{}{
+	must(bus.PublishSync("user.login", map[string]interface{}{
 		"event": loginEvent,
-	})
+	}))
 
 	// 5. 错误处理演示
 	fmt.Println("\n--- 错误处理演示 ---")
@@ -341,46 +347,54 @@ func main() {
 	}
 
 	// 测试被阻止的主题
-	bus.Subscribe("test", func(topic string, payload any) {
+	must(bus.Subscribe("test", func(topic string, payload any) {
 		fmt.Println("这不应该被执行")
-	})
-	bus.Publish("test", "blocked message")
+	}))
+	if err := bus.Publish("test", "blocked message"); err != nil {
+		log.Printf("发布被阻止主题失败: %v", err)
+	}
 
 	// 6. 通配符和分组订阅演示
 	fmt.Println("\n--- 通配符和分组订阅演示 ---")
 
 	// 使用通配符订阅所有用户事件
-	bus.Subscribe("user.*", func(topic string, payload any) {
+	must(bus.Subscribe("user.*", func(topic string, payload any) {
 		fmt.Printf("🔍 通配符用户事件: topic=%s\n", topic)
-	})
+	}))
 
 	// 使用通配符订阅所有系统事件
-	bus.Subscribe("system.#", func(topic string, payload any) {
+	must(bus.Subscribe("system.#", func(topic string, payload any) {
 		fmt.Printf("🔍 通配符系统事件: topic=%s\n", topic)
-	})
+	}))
 
 	// 使用分组订阅
-	bus.Subscribe("notifications/email/*", func(topic string, payload any) {
+	must(bus.Subscribe("notifications/email/*", func(topic string, payload any) {
 		fmt.Printf("📧 邮件通知: %v\n", payload)
-	})
-	bus.Subscribe("notifications/sms/*", func(topic string, payload any) {
+	}))
+	must(bus.Subscribe("notifications/sms/*", func(topic string, payload any) {
 		fmt.Printf("📱 短信通知: %v\n", payload)
-	})
+	}))
 
 	// 发布不同类型的事件
-	bus.Publish("user.logout", map[string]string{"username": "john"})
-	bus.Publish("system.cpu.high", 85)
-	bus.Publish("system.memory.low", 20)
-	bus.Publish("notifications/email/welcome", "欢迎使用我们的服务!")
-	bus.Publish("notifications/sms/verification", "您的验证码是 123456")
+	for topic, payload := range map[string]any{
+		"user.logout":                    map[string]string{"username": "john"},
+		"system.cpu.high":                85,
+		"system.memory.low":              20,
+		"notifications/email/welcome":    "欢迎使用我们的服务!",
+		"notifications/sms/verification": "您的验证码是 123456",
+	} {
+		if err := bus.Publish(topic, payload); err != nil {
+			log.Printf("发布事件失败: topic=%s err=%v", topic, err)
+		}
+	}
 
 	// 7. 演示带上下文的发布
 	fmt.Println("\n--- 带上下文发布演示 ---")
 
-	bus.Subscribe("system.metrics", func(topic string, payload any) {
+	must(bus.Subscribe("system.metrics", func(topic string, payload any) {
 		time.Sleep(2 * time.Second) // 模拟慢处理器
 		fmt.Println("📊 处理系统指标")
-	})
+	}))
 
 	// 带超时的上下文
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -404,33 +418,30 @@ func main() {
 	defer intPipe.Close()
 
 	// 添加带优先级的处理器
-	intPipe.SubscribeWithPriority(func(val int) {
+	must(intPipe.SubscribeWithPriority(func(val int) {
 		fmt.Printf("🔴 高优先级处理: %d\n", val)
-	}, 10)
+	}, 10))
 
-	intPipe.SubscribeWithPriority(func(val int) {
+	must(intPipe.SubscribeWithPriority(func(val int) {
 		fmt.Printf("🔵 低优先级处理: %d\n", val)
-	}, 1)
+	}, 1))
 
 	// 发布消息
-	intPipe.PublishSync(42)
+	must(intPipe.PublishSync(42))
 
 	// 创建结构体管道
 	msgPipe := eventbus.NewBufferedPipe[Message](50)
 	defer msgPipe.Close()
 
-	// 设置超时
-	msgPipe.SetTimeout(3 * time.Second)
-
-	msgPipe.Subscribe(func(msg Message) {
+	must(msgPipe.Subscribe(func(msg Message) {
 		fmt.Printf("📨 收到消息: ID=%s, 内容=%s\n", msg.ID, msg.Content)
-	})
+	}))
 
-	msgPipe.Publish(Message{
+	must(msgPipe.Publish(Message{
 		ID:      "msg001",
 		Content: "Hello, EventBus!",
 		Time:    time.Now(),
-	})
+	}))
 
 	// 测试管道关闭错误处理
 	msgPipe.Close()
@@ -442,17 +453,17 @@ func main() {
 	fmt.Println("\n--- 全局单例使用演示 ---")
 
 	// 订阅全局事件
-	eventbus.Subscribe("global.event", func(topic string, payload any) {
+	must(eventbus.Subscribe("global.event", func(topic string, payload any) {
 		fmt.Printf("🌍 全局事件: %v\n", payload)
-	})
+	}))
 
 	// 发布全局事件
-	eventbus.Publish("global.event", "Hello World")
-	eventbus.PublishSync("global.event", "Hello Again")
+	must(eventbus.Publish("global.event", "Hello World"))
+	must(eventbus.PublishSync("global.event", "Hello Again"))
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second*3)
 	defer cancel2()
-	eventbus.PublishWithContext(ctx2, "global.event", "Hello with Context")
+	must(eventbus.PublishWithContext(ctx2, "global.event", "Hello with Context"))
 
 	// 10. 演示并发性能
 	fmt.Println("\n--- 并发性能演示 ---")
@@ -462,10 +473,10 @@ func main() {
 	const messagesPerGoroutine = 100
 
 	// 订阅处理器
-	bus.Subscribe("performance.test", func(topic string, payload any) {
+	must(bus.Subscribe("performance.test", func(topic string, payload any) {
 		// 模拟处理时间
 		time.Sleep(time.Microsecond)
-	})
+	}))
 
 	start := time.Now()
 
@@ -475,11 +486,13 @@ func main() {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < messagesPerGoroutine; j++ {
-				bus.Publish("performance.test", map[string]interface{}{
+				if err := bus.Publish("performance.test", map[string]interface{}{
 					"goroutine": id,
 					"message":   j,
 					"timestamp": time.Now(),
-				})
+				}); err != nil {
+					log.Printf("并发发布失败: %v", err)
+				}
 			}
 		}(i)
 	}
