@@ -818,11 +818,13 @@ eventbus/
 │   │   ├── 架构图.md     # 系统架构图
 │   │   ├── 流程图.md     # 业务流程图
 │   │   └── 时序图.md     # 时序交互图
-│   ├── EventBus全面评估报告.md # 代码质量评估
-│   ├── 评估报告-执行摘要.md # 项目执行摘要
-│   ├── ToDos.md          # 任务清单
 │   ├── MQTT_COMPATIBILITY.md  # MQTT兼容性文档
-│   └── PublishSync响应式设计评估.md  # 响应式发布设计文档
+│   ├── API接口设计.md    # API接口详细设计文档
+│   ├── 方案设计规则.md   # 方案设计规则
+│   ├── 项目文档规范.md   # 文档编写规范
+│   ├── 项目概述.md       # 项目总体介绍
+│   ├── 性能评估报告.md   # 性能基准测试报告
+│   └── ARCHITECTURE.md   # 系统架构说明
 └── Makefile              # 构建脚本
 ```
 
@@ -835,12 +837,8 @@ eventbus/
 
 ### 开发文档
 - [MQTT兼容性说明](docs/MQTT_COMPATIBILITY.md) - 完整的MQTT通配符支持文档
-- [响应式发布设计评估](docs/PublishSync响应式设计评估.md) - PublishSyncAll/PublishSyncAny技术设计文档
 - [性能评估报告](docs/性能评估报告.md) - 基准测试分析、性能瓶颈识别和优化建议
-- [EventBus全面评估报告](docs/EventBus全面评估报告.md) - 代码质量和性能全面分析
-- [评估报告-执行摘要](docs/评估报告-执行摘要.md) - 项目执行情况摘要
 - [API接口设计](docs/API接口设计.md) - API接口详细设计文档
-- [任务清单](docs/ToDos.md) - 开发任务和进度跟踪
 
 ## 🤝 贡献指南
 
