@@ -7,22 +7,30 @@ import (
 func BenchmarkPipePublishSync(b *testing.B) {
 	pipe := NewPipe[int]()
 
-	pipe.Subscribe(pipeHandlerOne)
+	if err := pipe.Subscribe(pipeHandlerOne); err != nil {
+		b.Fatalf("订阅失败: %v", err)
+	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pipe.PublishSync(i)
+		if err := pipe.PublishSync(i); err != nil {
+			b.Fatalf("发布失败: %v", err)
+		}
 	}
 }
 
 func BenchmarkPipePublish(b *testing.B) {
 	pipe := NewPipe[int]()
 
-	pipe.Subscribe(pipeHandlerOne)
+	if err := pipe.Subscribe(pipeHandlerOne); err != nil {
+		b.Fatalf("订阅失败: %v", err)
+	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pipe.Publish(i)
+		if err := pipe.Publish(i); err != nil {
+			b.Fatalf("发布失败: %v", err)
+		}
 	}
 }
 

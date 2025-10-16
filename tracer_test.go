@@ -3,7 +3,6 @@ package eventbus
 import (
 	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,8 +43,8 @@ func TestMetricsTracer_OnSubscribe(t *testing.T) {
 	tracer.OnSubscribe("test.topic", handler)
 
 	metrics := tracer.GetMetrics()
-	count := metrics["subscriber_count"].(map[string]*atomic.Int32)["test.topic"].Load()
-	assert.Equal(t, int32(2), count)
+	countMap := metrics["subscriber_count"].(map[string]int32)
+	assert.Equal(t, int32(2), countMap["test.topic"])
 }
 
 func TestMetricsTracer_OnUnsubscribe(t *testing.T) {
@@ -57,8 +56,8 @@ func TestMetricsTracer_OnUnsubscribe(t *testing.T) {
 	tracer.OnUnsubscribe("test.topic", handler)
 
 	metrics := tracer.GetMetrics()
-	count := metrics["subscriber_count"].(map[string]*atomic.Int32)["test.topic"].Load()
-	assert.Equal(t, int32(0), count)
+	countMap := metrics["subscriber_count"].(map[string]int32)
+	assert.Zero(t, countMap["test.topic"])
 }
 
 func TestMetricsTracer_OnError(t *testing.T) {

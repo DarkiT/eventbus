@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Test_newCowMap(t *testing.T) {
@@ -13,7 +14,7 @@ func Test_newCowMap(t *testing.T) {
 	assert.NotNil(t, m)
 }
 
-func Test__CowMapLoad(t *testing.T) {
+func Test_CowMapLoad(t *testing.T) {
 	m := newCowMap()
 	for i := 0; i < 100; i++ {
 		m.Store(i, strconv.Itoa(i))
@@ -30,7 +31,7 @@ func Test__CowMapLoad(t *testing.T) {
 	assert.Equal(t, nil, val)
 }
 
-func Test__CowMapStore(t *testing.T) {
+func Test_CowMapStore(t *testing.T) {
 	m := newCowMap()
 	for i := 0; i < 100; i++ {
 		m.Store(i, strconv.Itoa(i))
@@ -39,7 +40,7 @@ func Test__CowMapStore(t *testing.T) {
 	assert.Equal(t, uint32(100), m.Len())
 }
 
-func Test__CowMapDelete(t *testing.T) {
+func Test_CowMapDelete(t *testing.T) {
 	m := newCowMap()
 	for i := 0; i < 100; i++ {
 		m.Store(i, strconv.Itoa(i))
@@ -62,7 +63,7 @@ func Test__CowMapDelete(t *testing.T) {
 	}
 }
 
-func Test__CowMapClear(t *testing.T) {
+func Test_CowMapClear(t *testing.T) {
 	m := newCowMap()
 	for i := 0; i < 100; i++ {
 		m.Store(i, strconv.Itoa(i))
@@ -72,7 +73,29 @@ func Test__CowMapClear(t *testing.T) {
 	assert.Equal(t, uint32(0), m.Len())
 }
 
-func Test__CowMapLen(t *testing.T) {
+func Test_CowMapStoreUncomparable(t *testing.T) {
+	m := newCowMap()
+	slice := []int{1, 2, 3}
+
+	require.NotPanics(t, func() {
+		m.Store("slice", slice)
+	})
+	require.NotPanics(t, func() {
+		m.Store("slice", slice)
+	})
+
+	mapValue := map[string]int{"a": 1}
+	require.NotPanics(t, func() {
+		m.Store("map", mapValue)
+	})
+	require.NotPanics(t, func() {
+		m.Store("map", mapValue)
+	})
+
+	assert.Equal(t, uint32(2), m.Len())
+}
+
+func Test_CowMapLen(t *testing.T) {
 	m := newCowMap()
 	for i := 0; i < 100; i++ {
 		m.Store(i, strconv.Itoa(i))
@@ -80,7 +103,7 @@ func Test__CowMapLen(t *testing.T) {
 	assert.Equal(t, uint32(100), m.Len())
 }
 
-func Test__CowMapRange(t *testing.T) {
+func Test_CowMapRange(t *testing.T) {
 	m := newCowMap()
 	expert := make([]bool, 100)
 
@@ -99,7 +122,7 @@ func Test__CowMapRange(t *testing.T) {
 	}
 }
 
-func Test__CowMapRangeStop(t *testing.T) {
+func Test_CowMapRangeStop(t *testing.T) {
 	m := newCowMap()
 	results := make([]bool, 100)
 
@@ -130,7 +153,7 @@ func Test__CowMapRangeStop(t *testing.T) {
 	assert.Equal(t, count, expert)
 }
 
-func Test__CowMapConcurrentLoadPanic(t *testing.T) {
+func Test_CowMapConcurrentLoadPanic(t *testing.T) {
 	m := newCowMap()
 	assert.NotPanics(t, func() {
 		for i := 0; i < 100; i++ {
@@ -143,7 +166,7 @@ func Test__CowMapConcurrentLoadPanic(t *testing.T) {
 	})
 }
 
-func Test__CowMapConcurrentStorePanic(t *testing.T) {
+func Test_CowMapConcurrentStorePanic(t *testing.T) {
 	m := newCowMap()
 	for i := 0; i < 100; i++ {
 		m.Store(i, strconv.Itoa(i))
@@ -160,7 +183,7 @@ func Test__CowMapConcurrentStorePanic(t *testing.T) {
 	})
 }
 
-func Test__CowMapStoreOrLoadConcurrent(t *testing.T) {
+func Test_CowMapStoreOrLoadConcurrent(t *testing.T) {
 	m := newCowMap()
 	for i := 0; i < 100; i++ {
 		m.Store(i, i)
@@ -197,7 +220,7 @@ func Test__CowMapStoreOrLoadConcurrent(t *testing.T) {
 	loadwg.Wait()
 }
 
-func Test__CowMapStoreAndLoadConcurrent(t *testing.T) {
+func Test_CowMapStoreAndLoadConcurrent(t *testing.T) {
 	m := newCowMap()
 	for i := 0; i < 100; i++ {
 		m.Store(i, i)

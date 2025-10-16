@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -20,23 +21,23 @@ func TestOptimizedEventBus_PrioritySubscription(t *testing.T) {
 	var mu sync.Mutex
 
 	// 添加不同优先级的处理器
-	bus.SubscribeWithPriority("test", func(topic string, payload any) {
+	require.NoError(t, bus.SubscribeWithPriority("test", func(topic string, payload any) {
 		mu.Lock()
 		order = append(order, 1)
 		mu.Unlock()
-	}, 1)
+	}, 1))
 
-	bus.SubscribeWithPriority("test", func(topic string, payload any) {
+	require.NoError(t, bus.SubscribeWithPriority("test", func(topic string, payload any) {
 		mu.Lock()
 		order = append(order, 10)
 		mu.Unlock()
-	}, 10)
+	}, 10))
 
-	bus.SubscribeWithPriority("test", func(topic string, payload any) {
+	require.NoError(t, bus.SubscribeWithPriority("test", func(topic string, payload any) {
 		mu.Lock()
 		order = append(order, 5)
 		mu.Unlock()
-	}, 5)
+	}, 5))
 
 	// 同步发布以确保顺序
 	err := bus.PublishSync("test", "message")
@@ -54,13 +55,16 @@ func TestOptimizedEventBus_ContextPublish(t *testing.T) {
 	defer bus.Close()
 
 	// 订阅一个慢处理器
-	bus.Subscribe("test", func(topic string, payload any) {
+	require.NoError(t, bus.Subscribe("test", func(topic string, payload any) {
 		time.Sleep(2 * time.Second) // 模拟慢处理
-	})
+	}))
 
 	// 先填满缓冲区
 	for i := 0; i < 10; i++ {
-		bus.Publish("test", fmt.Sprintf("message-%d", i))
+		err := bus.Publish("test", fmt.Sprintf("message-%d", i))
+		if err != nil && !errors.Is(err, ErrPublishTimeout) {
+			require.NoError(t, err)
+		}
 	}
 
 	// 测试超时 - 现在缓冲区应该满了
@@ -92,9 +96,9 @@ func TestOptimizedEventBus_AsyncPublish(t *testing.T) {
 	defer bus.Close()
 
 	var received int32
-	bus.Subscribe("test", func(topic string, payload any) {
+	require.NoError(t, bus.Subscribe("test", func(topic string, payload any) {
 		atomic.AddInt32(&received, 1)
-	})
+	}))
 
 	// 异步发布多条消息
 	for i := 0; i < 5; i++ {
@@ -116,35 +120,35 @@ func TestOptimizedEventBus_WildcardMatching(t *testing.T) {
 
 	// 测试精确匹配而不是通配符匹配
 	// 因为通配符功能可能还没有实现
-	bus.Subscribe("user.login", func(topic string, payload any) {
+	require.NoError(t, bus.Subscribe("user.login", func(topic string, payload any) {
 		mu.Lock()
 		received = append(received, topic)
 		mu.Unlock()
-	})
+	}))
 
-	bus.Subscribe("user.logout", func(topic string, payload any) {
+	require.NoError(t, bus.Subscribe("user.logout", func(topic string, payload any) {
 		mu.Lock()
 		received = append(received, topic)
 		mu.Unlock()
-	})
+	}))
 
-	bus.Subscribe("system.cpu.high", func(topic string, payload any) {
+	require.NoError(t, bus.Subscribe("system.cpu.high", func(topic string, payload any) {
 		mu.Lock()
 		received = append(received, topic)
 		mu.Unlock()
-	})
+	}))
 
-	bus.Subscribe("system.memory.low", func(topic string, payload any) {
+	require.NoError(t, bus.Subscribe("system.memory.low", func(topic string, payload any) {
 		mu.Lock()
 		received = append(received, topic)
 		mu.Unlock()
-	})
+	}))
 
 	// 发布匹配的消息
-	bus.PublishSync("user.login", "data")
-	bus.PublishSync("user.logout", "data")
-	bus.PublishSync("system.cpu.high", "data")
-	bus.PublishSync("system.memory.low", "data")
+	require.NoError(t, bus.PublishSync("user.login", "data"))
+	require.NoError(t, bus.PublishSync("user.logout", "data"))
+	require.NoError(t, bus.PublishSync("system.cpu.high", "data"))
+	require.NoError(t, bus.PublishSync("system.memory.low", "data"))
 
 	time.Sleep(50 * time.Millisecond)
 
@@ -169,9 +173,9 @@ func TestOptimizedEventBus_ErrorHandling(t *testing.T) {
 	bus.SetTracer(tracer)
 
 	// 添加会 panic 的处理器
-	bus.Subscribe("test", func(topic string, payload any) {
+	require.NoError(t, bus.Subscribe("test", func(topic string, payload any) {
 		panic("test panic")
-	})
+	}))
 
 	// 发布消息不应该导致程序崩溃
 	err := bus.PublishSync("test", "message")
@@ -214,23 +218,23 @@ func TestOptimizedPipe_Priority(t *testing.T) {
 	var mu sync.Mutex
 
 	// 添加不同优先级的处理器
-	pipe.SubscribeWithPriority(func(val int) {
+	require.NoError(t, pipe.SubscribeWithPriority(func(val int) {
 		mu.Lock()
 		order = append(order, 1)
 		mu.Unlock()
-	}, 1)
+	}, 1))
 
-	pipe.SubscribeWithPriority(func(val int) {
+	require.NoError(t, pipe.SubscribeWithPriority(func(val int) {
 		mu.Lock()
 		order = append(order, 10)
 		mu.Unlock()
-	}, 10)
+	}, 10))
 
-	pipe.SubscribeWithPriority(func(val int) {
+	require.NoError(t, pipe.SubscribeWithPriority(func(val int) {
 		mu.Lock()
 		order = append(order, 5)
 		mu.Unlock()
-	}, 5)
+	}, 5))
 
 	// 同步发布
 	err := pipe.PublishSync(42)
@@ -248,13 +252,13 @@ func TestOptimizedPipe_ContextPublish(t *testing.T) {
 	defer pipe.Close()
 
 	// 添加一个慢处理器来阻塞管道
-	pipe.Subscribe(func(val string) {
+	require.NoError(t, pipe.Subscribe(func(val string) {
 		time.Sleep(200 * time.Millisecond) // 慢处理
-	})
+	}))
 
 	// 填满缓冲区
-	pipe.Publish("first")
-	pipe.Publish("second") // 这个应该填满缓冲区
+	require.NoError(t, pipe.Publish("first"))
+	require.NoError(t, pipe.Publish("second")) // 这个应该填满缓冲区
 
 	// 测试超时 - 现在缓冲区应该满了
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -273,8 +277,8 @@ func TestOptimizedPipe_Stats(t *testing.T) {
 	pipe := NewBufferedPipe[int](50)
 	defer pipe.Close()
 
-	pipe.Subscribe(func(val int) {})
-	pipe.Subscribe(func(val int) {})
+	require.NoError(t, pipe.Subscribe(func(val int) {}))
+	require.NoError(t, pipe.Subscribe(func(val int) {}))
 
 	stats := pipe.GetStats()
 	assert.Equal(t, 2, stats["handler_count"])
@@ -294,10 +298,17 @@ func TestOptimizedSingleton_ThreadSafety(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			handler := func(topic string, payload any) {}
 
-			Subscribe("test", func(topic string, payload any) {})
-			Publish("test", id)
-			Unsubscribe("test", func(topic string, payload any) {})
+			if err := Subscribe("test", handler); err != nil {
+				t.Errorf("订阅失败: %v", err)
+			}
+			if err := Publish("test", id); err != nil {
+				t.Errorf("发布失败: %v", err)
+			}
+			if err := Unsubscribe("test", handler); err != nil && err != ErrNoSubscriber {
+				t.Errorf("取消订阅失败: %v", err)
+			}
 		}(i)
 	}
 
@@ -311,14 +322,19 @@ func BenchmarkOptimizedEventBus_Publish(b *testing.B) {
 	bus := New(1000)
 	defer bus.Close()
 
-	bus.Subscribe("test", func(topic string, payload any) {
+	if err := bus.Subscribe("test", func(topic string, payload any) {
 		// 空处理器
-	})
+	}); err != nil {
+		b.Fatalf("订阅失败: %v", err)
+	}
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			bus.Publish("test", "message")
+			err := bus.Publish("test", "message")
+			if err != nil && !errors.Is(err, ErrPublishTimeout) {
+				panic(err)
+			}
 		}
 	})
 }
@@ -327,14 +343,18 @@ func BenchmarkOptimizedEventBus_PublishSync(b *testing.B) {
 	bus := New()
 	defer bus.Close()
 
-	bus.Subscribe("test", func(topic string, payload any) {
+	if err := bus.Subscribe("test", func(topic string, payload any) {
 		// 空处理器
-	})
+	}); err != nil {
+		b.Fatalf("订阅失败: %v", err)
+	}
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			bus.PublishSync("test", "message")
+			if err := bus.PublishSync("test", "message"); err != nil {
+				panic(err)
+			}
 		}
 	})
 }
@@ -343,14 +363,18 @@ func BenchmarkOptimizedPipe_Publish(b *testing.B) {
 	pipe := NewBufferedPipe[string](1000)
 	defer pipe.Close()
 
-	pipe.Subscribe(func(val string) {
+	if err := pipe.Subscribe(func(val string) {
 		// 空处理器
-	})
+	}); err != nil {
+		b.Fatalf("订阅失败: %v", err)
+	}
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			pipe.Publish("message")
+			if err := pipe.Publish("message"); err != nil {
+				panic(err)
+			}
 		}
 	})
 }

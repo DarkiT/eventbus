@@ -27,10 +27,11 @@ func Test_SingletonSubscribe(t *testing.T) {
 	})
 
 	assert.Equal(t, ErrHandlerFirstParam, err)
-	singleton.Close()
+
+	// 测试关闭后的操作
+	Close()
 	err = Unsubscribe("testtopic", busHandlerTwo)
 	assert.Equal(t, ErrChannelClosed, err)
-	Close()
 }
 
 func Test_SingletonUnsubscribe(t *testing.T) {
@@ -44,11 +45,11 @@ func Test_SingletonUnsubscribe(t *testing.T) {
 
 	err = Unsubscribe("testtopic", busHandlerOne)
 	assert.Nil(t, err)
-	singleton.Close()
 
+	// 测试关闭后的操作
+	Close()
 	err = Unsubscribe("testtopic", busHandlerTwo)
 	assert.Equal(t, ErrChannelClosed, err)
-	Close()
 }
 
 func Test_SingletonPublish(t *testing.T) {
@@ -112,14 +113,18 @@ func Test_SingletonPublishSync(t *testing.T) {
 
 func BenchmarkSingletonPublish(b *testing.B) {
 	ResetSingleton()
-	Subscribe("testtopic", busHandlerOne)
+	if err := Subscribe("testtopic", busHandlerOne); err != nil {
+		b.Fatalf("订阅失败: %v", err)
+	}
 
 	b.ResetTimer()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		for i := 0; i < b.N; i++ {
-			Publish("testtopic", i)
+			if err := Publish("testtopic", i); err != nil {
+				panic(err)
+			}
 		}
 		wg.Done()
 	}()
@@ -129,14 +134,18 @@ func BenchmarkSingletonPublish(b *testing.B) {
 
 func BenchmarkSingletonPublishSync(b *testing.B) {
 	ResetSingleton()
-	Subscribe("testtopic", busHandlerOne)
+	if err := Subscribe("testtopic", busHandlerOne); err != nil {
+		b.Fatalf("订阅失败: %v", err)
+	}
 
 	b.ResetTimer()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		for i := 0; i < b.N; i++ {
-			PublishSync("testtopic", i)
+			if err := PublishSync("testtopic", i); err != nil {
+				panic(err)
+			}
 		}
 		wg.Done()
 	}()

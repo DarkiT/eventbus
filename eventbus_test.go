@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -98,13 +99,13 @@ func Test_channelPublish(t *testing.T) {
 	assert.NotNil(t, ch)
 	assert.NotNil(t, ch.channel)
 	assert.Equal(t, "test_topic", ch.topic)
-	ch.subscribe(busHandlerOne)
+	require.NoError(t, ch.subscribe(busHandlerOne))
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		for i := 0; i < 100; i++ {
-			err := ch.publishAsync(i)
+			err := ch.publishAsync(context.Background(), "test_topic", i)
 			assert.Nil(t, err)
 		}
 		wg.Done()
@@ -114,7 +115,7 @@ func Test_channelPublish(t *testing.T) {
 	// 等待消息处理完成
 	time.Sleep(time.Millisecond)
 	ch.close()
-	err := ch.publishAsync(1)
+	err := ch.publishAsync(context.Background(), "test_topic", 1)
 	assert.Equal(t, ErrChannelClosed, err)
 }
 
@@ -124,24 +125,24 @@ func Test_channelPublishSync(t *testing.T) {
 	assert.NotNil(t, ch)
 	assert.NotNil(t, ch.channel)
 	assert.Equal(t, "test_topic", ch.topic)
-	ch.subscribe(busHandlerOne)
+	require.NoError(t, ch.subscribe(busHandlerOne))
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		for i := 0; i < 100; i++ {
-			err := ch.publishSync(i)
+			err := ch.publishSync(context.Background(), "test_topic", i)
 			assert.Nil(t, err)
 		}
 		wg.Done()
 	}()
 	wg.Wait()
 
-	err := ch.publishSync(nil)
+	err := ch.publishSync(context.Background(), "test_topic", nil)
 	assert.Nil(t, err)
 	time.Sleep(time.Millisecond)
 	ch.close()
-	err = ch.publishSync(1)
+	err = ch.publishSync(context.Background(), "test_topic", 1)
 	assert.Equal(t, ErrChannelClosed, err)
 }
 
@@ -207,6 +208,282 @@ func Test_EventBusSubscribe(t *testing.T) {
 
 	err = bus.Unsubscribe("testtopic", busHandlerTwo)
 	assert.Equal(t, ErrChannelClosed, err)
+}
+
+func TestSubscribeHandlerWithContext(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	received := make(chan context.Context, 1)
+
+	err := bus.Subscribe("ctx.topic", func(ctx context.Context, topic string, payload any) {
+		received <- ctx
+		<-ctx.Done()
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	err = bus.PublishWithContext(ctx, "ctx.topic", "payload")
+	require.NoError(t, err)
+
+	select {
+	case receivedCtx := <-received:
+		assert.Equal(t, ctx, receivedCtx)
+	case <-time.After(time.Second):
+		t.Fatal("未接收到上下文")
+	}
+
+	ctxSync, cancelSync := context.WithCancel(context.Background())
+	go func() {
+		<-time.After(20 * time.Millisecond)
+		cancelSync()
+	}()
+
+	err = bus.PublishSyncWithContext(ctxSync, "ctx.topic", "payload")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestPublishSyncAnyCancelsSlowerHandlers(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	slowCanceled := make(chan struct{}, 1)
+
+	require.NoError(t, bus.SubscribeWithResponseContext("resp.topic", func(ctx context.Context, topic string, payload any) (any, error) {
+		<-ctx.Done()
+		slowCanceled <- struct{}{}
+		return nil, ctx.Err()
+	}))
+	require.NoError(t, bus.SubscribeWithResponseContext("resp.topic", func(ctx context.Context, topic string, payload any) (any, error) {
+		return "ok", nil
+	}))
+
+	result, err := bus.PublishSyncAny("resp.topic", "payload")
+	assert.NoError(t, err)
+	assert.True(t, result.Success)
+	assert.Equal(t, 2, result.HandlerCount)
+	assert.GreaterOrEqual(t, result.SuccessCount, 1)
+
+	select {
+	case <-slowCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("慢处理器未被取消")
+	}
+}
+
+func TestPublishSyncAnyWithContextPropagatesValues(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	type ctxKey string
+	const traceKey ctxKey = "trace-id"
+
+	received := make(chan string, 1)
+
+	require.NoError(t, bus.SubscribeWithResponseContext("resp.ctx", func(ctx context.Context, topic string, payload any) (any, error) {
+		val, _ := ctx.Value(traceKey).(string)
+		received <- val
+		return payload, nil
+	}))
+
+	ctx := context.WithValue(context.Background(), traceKey, "TRACE-001")
+	result, err := bus.PublishSyncAnyWithContext(ctx, "resp.ctx", "payload")
+	require.NoError(t, err)
+	require.True(t, result.Success)
+
+	select {
+	case got := <-received:
+		assert.Equal(t, "TRACE-001", got)
+	case <-time.After(time.Second):
+		t.Fatal("未接收到上下文中的 trace 信息")
+	}
+}
+
+func TestTopicGroupAdvancedMethods(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	group := bus.NewGroup("order")
+
+	var order []int
+	var mu sync.Mutex
+	require.NoError(t, group.SubscribeWithPriority("created", func(topic string, payload any) {
+		mu.Lock()
+		order = append(order, 1)
+		mu.Unlock()
+	}, 5))
+	require.NoError(t, group.SubscribeWithPriority("created", func(topic string, payload any) {
+		mu.Lock()
+		order = append(order, 2)
+		mu.Unlock()
+	}, 1))
+
+	type ctxKey string
+	const userKey ctxKey = "user"
+
+	received := make(chan string, 1)
+	require.NoError(t, group.SubscribeWithResponseContext("created", func(ctx context.Context, topic string, payload any) (any, error) {
+		val, _ := ctx.Value(userKey).(string)
+		received <- val
+		return payload, nil
+	}))
+
+	ctx := context.WithValue(context.Background(), userKey, "tester")
+	result, err := group.PublishSyncAnyWithContext(ctx, "created", "ok")
+	require.NoError(t, err)
+	require.True(t, result.Success)
+
+	timeout := time.NewTimer(time.Second)
+	select {
+	case got := <-received:
+		assert.Equal(t, "tester", got)
+	case <-timeout.C:
+		t.Fatal("未接收到上下文中的 user 信息")
+	}
+
+	require.NoError(t, group.PublishSync("created", "payload"))
+
+	// 验证优先级顺序
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Len(t, order, 2)
+	assert.Equal(t, []int{1, 2}, order)
+
+	require.NoError(t, group.UnsubscribeAll("created"))
+}
+
+func TestSingletonAdvancedWrappers(t *testing.T) {
+	ResetSingleton()
+	defer Close()
+
+	received := make(chan struct{}, 1)
+	require.NoError(t, SubscribeWithResponse("singleton.topic", func(topic string, payload any) (any, error) {
+		received <- struct{}{}
+		return payload, nil
+	}))
+
+	result, err := PublishSyncAny("singleton.topic", "ok")
+	require.NoError(t, err)
+	require.True(t, result.Success)
+
+	select {
+	case <-received:
+		// ok
+	case <-time.After(time.Second):
+		t.Fatal("单例响应未触发")
+	}
+
+	stats := GetStats()
+	var channelCount int
+	switch v := stats["channel_count"].(type) {
+	case int:
+		channelCount = v
+	case int32:
+		channelCount = int(v)
+	case int64:
+		channelCount = int(v)
+	case uint32:
+		channelCount = int(v)
+	case uint64:
+		channelCount = int(v)
+	default:
+		t.Fatalf("未知的 channel_count 类型: %T", v)
+	}
+	assert.GreaterOrEqual(t, channelCount, 1)
+
+	group := NewGroup("singleton")
+	require.NotNil(t, group)
+	handler := func(topic string, payload any) {}
+	require.NoError(t, group.Subscribe("sub", handler))
+	require.NoError(t, group.Unsubscribe("sub", handler))
+}
+
+func TestSmartFilter(t *testing.T) {
+	filter := NewSmartFilter()
+	assert.True(t, filter.Filter("user.login", nil))
+	filter.BlockTopic("user.test")
+	assert.False(t, filter.Filter("user.test", nil))
+	assert.False(t, filter.Filter("user.test.detail", nil))
+
+	filter.SetLimit("user.login", 1)
+	assert.True(t, filter.Filter("user.login", nil))
+	assert.False(t, filter.Filter("user.login", nil))
+
+	filter.UnblockTopic("user.test")
+	assert.True(t, filter.Filter("user.test", nil))
+}
+
+func TestMiddleware(t *testing.T) {
+	mw := NewMiddleware()
+	mw.SetTransformer(func(topic string, payload any) any {
+		if s, ok := payload.(string); ok {
+			return strings.ToUpper(s)
+		}
+		return payload
+	})
+
+	converted := mw.Before("order.created", "ok")
+	assert.Equal(t, "OK", converted)
+
+	// 模拟处理耗时
+	time.Sleep(time.Millisecond)
+	mw.After("order.created", converted)
+
+	stats := mw.GetStats()
+	stat, ok := stats["order.created"]
+	assert.True(t, ok)
+	assert.Equal(t, 1, stat.Count)
+	assert.Greater(t, stat.TotalTime, time.Duration(0))
+
+	mw.Reset()
+	assert.Empty(t, mw.GetStats())
+}
+
+func TestUnsubscribeAllClearsResponseHandlers(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	require.NoError(t, bus.SubscribeWithResponse("clean.topic", func(topic string, payload any) (any, error) {
+		return payload, nil
+	}))
+
+	require.NoError(t, bus.UnsubscribeAll("clean.topic"))
+
+	ch, ok := bus.channels.Load(normalizeTopic("clean.topic"))
+	if !ok {
+		t.Fatal("未找到通道")
+	}
+
+	channel := ch.(*channel)
+	channel.RLock()
+	defer channel.RUnlock()
+	assert.Empty(t, channel.responseHandlers)
+	assert.Empty(t, channel.responseMap)
+}
+
+func TestUnsubscribeResponseHandler(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	responseHandler := func(topic string, payload any) (any, error) {
+		return payload, nil
+	}
+
+	require.NoError(t, bus.SubscribeWithResponse("resp.cleanup", responseHandler))
+	require.NoError(t, bus.Unsubscribe("resp.cleanup", responseHandler))
+
+	ch, ok := bus.channels.Load(normalizeTopic("resp.cleanup"))
+	require.True(t, ok)
+	channel := ch.(*channel)
+	channel.RLock()
+	defer channel.RUnlock()
+	assert.Empty(t, channel.responseHandlers)
 }
 
 func Test_EventBusUnsubscribe(t *testing.T) {
@@ -287,23 +564,23 @@ func Test_EventBusPrioritySubscription(t *testing.T) {
 	var mu sync.Mutex
 
 	// 添加不同优先级的处理器
-	bus.SubscribeWithPriority("test", func(topic string, payload any) {
+	require.NoError(t, bus.SubscribeWithPriority("test", func(topic string, payload any) {
 		mu.Lock()
 		order = append(order, 1)
 		mu.Unlock()
-	}, 1)
+	}, 1))
 
-	bus.SubscribeWithPriority("test", func(topic string, payload any) {
+	require.NoError(t, bus.SubscribeWithPriority("test", func(topic string, payload any) {
 		mu.Lock()
 		order = append(order, 10)
 		mu.Unlock()
-	}, 10)
+	}, 10))
 
-	bus.SubscribeWithPriority("test", func(topic string, payload any) {
+	require.NoError(t, bus.SubscribeWithPriority("test", func(topic string, payload any) {
 		mu.Lock()
 		order = append(order, 5)
 		mu.Unlock()
-	}, 5)
+	}, 5))
 
 	// 同步发布以确保顺序
 	err := bus.PublishSync("test", "message")
@@ -321,16 +598,29 @@ func Test_EventBusContextPublish(t *testing.T) {
 	defer bus.Close()
 
 	received := make(chan bool, 1)
-	bus.Subscribe("test", func(topic string, payload any) {
+	require.NoError(t, bus.Subscribe("test", func(topic string, payload any) {
 		time.Sleep(2 * time.Second) // 模拟慢处理
 		received <- true
-	})
+	}))
 
-	// 测试超时
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
+	// 异步发布不会因为慢处理阻塞
+	ctxAsync, cancelAsync := context.WithTimeout(context.Background(), time.Second)
+	defer cancelAsync()
 
-	err := bus.PublishWithContext(ctx, "test", "message")
+	err := bus.PublishWithContext(ctxAsync, "test", "message")
+	assert.NoError(t, err)
+
+	select {
+	case <-received:
+	case <-time.After(3 * time.Second):
+		t.Fatal("异步发布未触发处理器")
+	}
+
+	// 同步发布将受到上下文超时影响
+	ctxSync, cancelSync := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelSync()
+
+	err = bus.PublishSyncWithContext(ctxSync, "test", "message")
 	assert.Error(t, err)
 	assert.Equal(t, context.DeadlineExceeded, err)
 }
@@ -340,9 +630,9 @@ func Test_EventBusAsyncPublish(t *testing.T) {
 	defer bus.Close()
 
 	var received int32
-	bus.Subscribe("test", func(topic string, payload any) {
+	require.NoError(t, bus.Subscribe("test", func(topic string, payload any) {
 		atomic.AddInt32(&received, 1)
-	})
+	}))
 
 	// 异步发布多条消息
 	for i := 0; i < 5; i++ {
@@ -357,14 +647,18 @@ func Test_EventBusAsyncPublish(t *testing.T) {
 
 func BenchmarkEventBusPublish(b *testing.B) {
 	bus := New()
-	bus.Subscribe("testtopic", busHandlerOne)
+	if err := bus.Subscribe("testtopic", busHandlerOne); err != nil {
+		b.Fatalf("订阅失败: %v", err)
+	}
 
 	b.ResetTimer()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		for i := 0; i < b.N; i++ {
-			bus.Publish("testtopic", i)
+			if err := bus.Publish("testtopic", i); err != nil {
+				panic(err)
+			}
 		}
 		wg.Done()
 	}()
@@ -374,14 +668,18 @@ func BenchmarkEventBusPublish(b *testing.B) {
 
 func BenchmarkEventBusPublishSync(b *testing.B) {
 	bus := New()
-	bus.Subscribe("testtopic", busHandlerOne)
+	if err := bus.Subscribe("testtopic", busHandlerOne); err != nil {
+		b.Fatalf("订阅失败: %v", err)
+	}
 
 	b.ResetTimer()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		for i := 0; i < b.N; i++ {
-			bus.PublishSync("testtopic", i)
+			if err := bus.PublishSync("testtopic", i); err != nil {
+				panic(err)
+			}
 		}
 		wg.Done()
 	}()
@@ -394,13 +692,17 @@ func BenchmarkHighConcurrency(b *testing.B) {
 	topics := []string{"topic1", "topic2", "topic3"}
 
 	for _, topic := range topics {
-		bus.Subscribe(topic, func(t string, p interface{}) {})
+		if err := bus.Subscribe(topic, func(t string, p interface{}) {}); err != nil {
+			panic(err)
+		}
 	}
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			topic := topics[len(topics)%3] // 简化随机选择
-			bus.Publish(topic, "test")
+			if err := bus.Publish(topic, "test"); err != nil {
+				panic(err)
+			}
 		}
 	})
 }
@@ -439,11 +741,24 @@ func TestEventBus_Middleware(t *testing.T) {
 	}
 
 	bus.Use(middleware)
-	bus.Subscribe("test", func(topic string, payload int) {})
-	bus.Publish("test", 1)
+	require.NoError(t, bus.Subscribe("test", func(topic string, payload int) {}))
+	require.NoError(t, bus.Publish("test", 1))
 
 	time.Sleep(50 * time.Millisecond) // 等待异步处理
 	assert.Equal(t, 2, count)
+}
+
+func TestEventBusFilterPanic(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	bus.AddFilter(&testFilter{filterFunc: func(topic string, payload any) bool {
+		panic("boom")
+	}})
+
+	err := bus.Publish("panic.topic", 1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "filter panic")
 }
 
 // 测试辅助类型
@@ -489,6 +804,40 @@ func Test_EventBusTracer(t *testing.T) {
 	// 测试取消订阅 - 使用相同的处理器变量
 	err = bus.Unsubscribe("test", handler)
 	assert.Nil(t, err)
+}
+
+func TestEventBusOnComplete(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	tracer := newRecordingTracer()
+	bus.SetTracer(tracer)
+
+	require.NoError(t, bus.Subscribe("complete.topic", func(topic string, payload any) {}))
+	require.NoError(t, bus.PublishSync("complete.topic", "payload"))
+
+	select {
+	case meta := <-tracer.completeCh:
+		assert.Equal(t, 1, meta.HandlerCount)
+		assert.True(t, meta.Success)
+	case <-time.After(time.Second):
+		t.Fatal("未捕获到同步处理完成事件")
+	}
+
+	require.NoError(t, bus.SubscribeWithResponse("complete.response", func(topic string, payload any) (any, error) {
+		return payload, nil
+	}))
+	result, err := bus.PublishSyncAll("complete.response", "payload")
+	require.NoError(t, err)
+	assert.True(t, result.Success)
+
+	select {
+	case meta := <-tracer.completeCh:
+		assert.GreaterOrEqual(t, meta.HandlerCount, 1)
+		assert.True(t, meta.Success)
+	case <-time.After(time.Second):
+		t.Fatal("未捕获到响应式处理完成事件")
+	}
 }
 
 func Test_EventBusClose(t *testing.T) {
@@ -538,3 +887,26 @@ func (m *mockTracer) OnError(topic string, err error)                           
 func (m *mockTracer) OnQueueFull(topic string, queueSize int)                           {}
 func (m *mockTracer) OnSlowConsumer(topic string, latency time.Duration)                {}
 func (m *mockTracer) OnComplete(topic string, metadata CompleteMetadata)                {}
+
+type recordingTracer struct {
+	completeCh chan CompleteMetadata
+}
+
+func newRecordingTracer() *recordingTracer {
+	return &recordingTracer{
+		completeCh: make(chan CompleteMetadata, 8),
+	}
+}
+
+func (r *recordingTracer) OnPublish(topic string, payload any, metadata PublishMetadata) {}
+func (r *recordingTracer) OnSubscribe(topic string, handler any)                         {}
+func (r *recordingTracer) OnUnsubscribe(topic string, handler any)                       {}
+func (r *recordingTracer) OnError(topic string, err error)                               {}
+func (r *recordingTracer) OnQueueFull(topic string, size int)                            {}
+func (r *recordingTracer) OnSlowConsumer(topic string, latency time.Duration)            {}
+func (r *recordingTracer) OnComplete(topic string, metadata CompleteMetadata) {
+	select {
+	case r.completeCh <- metadata:
+	default:
+	}
+}
