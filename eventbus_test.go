@@ -2,6 +2,8 @@ package eventbus
 
 import (
 	"context"
+	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,7 +59,8 @@ func Test_channelSubscribe(t *testing.T) {
 	assert.Nil(t, err)
 	ch.close()
 	err = ch.subscribe(busHandlerTwo)
-	assert.Equal(t, ErrChannelClosed, err)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrChannelClosed))
 }
 
 func Test_channelUnsubscribe(t *testing.T) {
@@ -76,7 +79,8 @@ func Test_channelUnsubscribe(t *testing.T) {
 	assert.Nil(t, err)
 	ch.close()
 	err = ch.unsubscribe(busHandlerTwo)
-	assert.Equal(t, ErrChannelClosed, err)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrChannelClosed))
 }
 
 func Test_channelClose(t *testing.T) {
@@ -102,21 +106,20 @@ func Test_channelPublish(t *testing.T) {
 	require.NoError(t, ch.subscribe(busHandlerOne))
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		for i := 0; i < 100; i++ {
+	wg.Go(func() {
+		for i := range 100 {
 			err := ch.publishAsync(context.Background(), "test_topic", i)
 			assert.Nil(t, err)
 		}
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 
 	// 等待消息处理完成
 	time.Sleep(time.Millisecond)
 	ch.close()
 	err := ch.publishAsync(context.Background(), "test_topic", 1)
-	assert.Equal(t, ErrChannelClosed, err)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrChannelClosed))
 }
 
 func Test_channelPublishSync(t *testing.T) {
@@ -128,14 +131,12 @@ func Test_channelPublishSync(t *testing.T) {
 	require.NoError(t, ch.subscribe(busHandlerOne))
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		for i := 0; i < 100; i++ {
+	wg.Go(func() {
+		for i := range 100 {
 			err := ch.publishSync(context.Background(), "test_topic", i)
 			assert.Nil(t, err)
 		}
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 
 	err := ch.publishSync(context.Background(), "test_topic", nil)
@@ -143,7 +144,8 @@ func Test_channelPublishSync(t *testing.T) {
 	time.Sleep(time.Millisecond)
 	ch.close()
 	err = ch.publishSync(context.Background(), "test_topic", 1)
-	assert.Equal(t, ErrChannelClosed, err)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrChannelClosed))
 }
 
 func Test_New(t *testing.T) {
@@ -207,7 +209,7 @@ func Test_EventBusSubscribe(t *testing.T) {
 	bus.Close()
 
 	err = bus.Unsubscribe("testtopic", busHandlerTwo)
-	assert.Equal(t, ErrChannelClosed, err)
+	assert.Equal(t, ErrEventBusClosed, err)
 }
 
 func TestSubscribeHandlerWithContext(t *testing.T) {
@@ -455,16 +457,10 @@ func TestUnsubscribeAllClearsResponseHandlers(t *testing.T) {
 
 	require.NoError(t, bus.UnsubscribeAll("clean.topic"))
 
-	ch, ok := bus.channels.Load(normalizeTopic("clean.topic"))
-	if !ok {
-		t.Fatal("未找到通道")
-	}
-
-	channel := ch.(*channel)
-	channel.RLock()
-	defer channel.RUnlock()
-	assert.Empty(t, channel.responseHandlers)
-	assert.Empty(t, channel.responseMap)
+	normalized, _ := normalizeTopic("clean.topic")
+	ch, ok := bus.channels.Load(normalized)
+	assert.False(t, ok)
+	assert.Nil(t, ch)
 }
 
 func TestUnsubscribeResponseHandler(t *testing.T) {
@@ -478,12 +474,10 @@ func TestUnsubscribeResponseHandler(t *testing.T) {
 	require.NoError(t, bus.SubscribeWithResponse("resp.cleanup", responseHandler))
 	require.NoError(t, bus.Unsubscribe("resp.cleanup", responseHandler))
 
-	ch, ok := bus.channels.Load(normalizeTopic("resp.cleanup"))
-	require.True(t, ok)
-	channel := ch.(*channel)
-	channel.RLock()
-	defer channel.RUnlock()
-	assert.Empty(t, channel.responseHandlers)
+	respNorm, _ := normalizeTopic("resp.cleanup")
+	ch, ok := bus.channels.Load(respNorm)
+	assert.False(t, ok)
+	assert.Nil(t, ch)
 }
 
 func Test_EventBusUnsubscribe(t *testing.T) {
@@ -500,10 +494,30 @@ func Test_EventBusUnsubscribe(t *testing.T) {
 
 	err = bus.Unsubscribe("testtopic", busHandlerOne)
 	assert.Nil(t, err)
+	assert.Equal(t, 0, bus.channels.Len())
 	bus.Close()
 
 	err = bus.Unsubscribe("testtopic", busHandlerTwo)
-	assert.Equal(t, ErrChannelClosed, err)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrEventBusClosed))
+}
+
+func Test_EventBusUnsubscribe_PrunesChannelAndAllowsResubscribe(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count atomic.Int32
+	handler := func(topic string, payload any) {
+		count.Add(1)
+	}
+
+	require.NoError(t, bus.Subscribe("re.topic", handler))
+	require.NoError(t, bus.Unsubscribe("re.topic", handler))
+	assert.Equal(t, 0, bus.channels.Len())
+
+	require.NoError(t, bus.Subscribe("re.topic", handler))
+	require.NoError(t, bus.PublishSync("re.topic", "payload"))
+	assert.Equal(t, int32(1), count.Load())
 }
 
 func Test_EventBusPublish(t *testing.T) {
@@ -519,16 +533,67 @@ func Test_EventBusPublish(t *testing.T) {
 	assert.Nil(t, err)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		for i := 0; i < 100; i++ {
+	wg.Go(func() {
+		for i := range 100 {
 			err := bus.Publish("testtopic", i)
 			assert.Nil(t, err)
 		}
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 	bus.Close()
+}
+
+func Test_SubscribeConcurrentSingleChannel_NoDuplicateCreation(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	topic := "dup.topic"
+	startG := runtime.NumGoroutine()
+
+	handler := func(topic string, payload any) {}
+
+	const concurrency = 100
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer wg.Done()
+			require.NoError(t, bus.SubscribeWithPriority(topic, handler, 0))
+		}()
+	}
+	wg.Wait()
+
+	// 其他订阅入口也应复用同一通道
+	require.NoError(t, bus.SubscribeWithResponse(topic, func(topic string, payload any) (any, error) {
+		return payload, nil
+	}))
+	require.NoError(t, bus.SubscribeWithResponseContext(topic, func(ctx context.Context, topic string, payload any) (any, error) {
+		return payload, nil
+	}))
+
+	normalized, _ := normalizeTopic(topic)
+	ch, ok := bus.channels.Load(normalized)
+	require.True(t, ok, "通道应已创建")
+	assert.Equal(t, 1, bus.channels.Len(), "并发订阅应只创建一个通道")
+
+	// 功能向后兼容：发布后处理器被调用
+	var delivered int32
+	require.NoError(t, bus.Subscribe(topic, func(t string, payload any) {
+		atomic.AddInt32(&delivered, 1)
+	}))
+	require.NoError(t, bus.PublishSync(topic, "msg"))
+	time.Sleep(10 * time.Millisecond)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&delivered))
+
+	// 关闭后 goroutine 不应明显泄漏
+	bus.Close()
+	time.Sleep(50 * time.Millisecond)
+	endG := runtime.NumGoroutine()
+	assert.LessOrEqual(t, endG, startG+5, "不应出现明显 goroutine 泄漏")
+
+	// 防止编译器优化未使用变量
+	_ = ch
+	_ = ok
 }
 
 func Test_EventBusPublishSync(t *testing.T) {
@@ -544,14 +609,12 @@ func Test_EventBusPublishSync(t *testing.T) {
 	assert.Nil(t, err)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		for i := 0; i < 100; i++ {
+	wg.Go(func() {
+		for i := range 100 {
 			err := bus.PublishSync("testtopic", i)
 			assert.Nil(t, err)
 		}
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 	bus.Close()
 }
@@ -591,6 +654,153 @@ func Test_EventBusPrioritySubscription(t *testing.T) {
 	expected := []int{10, 5, 1}
 	assert.Equal(t, expected, order)
 	mu.Unlock()
+}
+
+func Test_EventBusGlobalPriorityOrderingWithWildcard(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var order []string
+	var mu sync.Mutex
+
+	require.NoError(t, bus.SubscribeWithPriority("a/b", func(topic string, payload any) {
+		mu.Lock()
+		order = append(order, "specific")
+		mu.Unlock()
+	}, 1))
+
+	require.NoError(t, bus.SubscribeWithPriority("a/#", func(topic string, payload any) {
+		mu.Lock()
+		order = append(order, "wildcard")
+		mu.Unlock()
+	}, 10))
+
+	require.NoError(t, bus.PublishSync("a/b", "payload"))
+
+	mu.Lock()
+	assert.Equal(t, []string{"wildcard", "specific"}, order)
+	mu.Unlock()
+}
+
+func Test_EventBusPublishSync_DoesNotDedupDifferentSubscriptions(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count atomic.Int32
+	handler := func(topic string, payload any) {
+		count.Add(1)
+	}
+
+	require.NoError(t, bus.Subscribe("dup.topic", handler))
+	require.NoError(t, bus.Subscribe("dup.#", handler))
+
+	require.NoError(t, bus.PublishSync("dup.topic", "payload"))
+	assert.Equal(t, int32(2), count.Load())
+}
+
+func Test_EventBusPublishSync_KeepsDuplicateSubscriptionsConsistent(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count atomic.Int32
+	handler := func(topic string, payload any) {
+		count.Add(1)
+	}
+
+	require.NoError(t, bus.Subscribe("dup.same", handler))
+	require.NoError(t, bus.Subscribe("dup.same", handler))
+
+	require.NoError(t, bus.PublishSync("dup.same", "payload"))
+	assert.Equal(t, int32(2), count.Load())
+}
+
+func Test_EventBusRejectsInvalidWildcardPattern(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	handler := func(topic string, payload any) {}
+
+	require.ErrorIs(t, bus.Subscribe("invalid.#.topic", handler), ErrInvalidTopic)
+	require.ErrorIs(t, bus.Subscribe("invalid.segment*", handler), ErrInvalidTopic)
+	require.ErrorIs(t, bus.PublishSync("invalid.segment*", "payload"), ErrInvalidTopic)
+}
+
+func Test_EventBusSubscribeOnce_Concurrent(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count atomic.Int32
+	require.NoError(t, bus.SubscribeOnce("once.topic", func(topic string, payload any) {
+		count.Add(1)
+	}))
+
+	var wg sync.WaitGroup
+	const concurrency = 200
+	wg.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer wg.Done()
+			_ = bus.Publish("once.topic", "payload")
+		}()
+	}
+	wg.Wait()
+	time.Sleep(50 * time.Millisecond)
+
+	assert.Equal(t, int32(1), count.Load())
+
+	// 再次发布也不应触发
+	_ = bus.Publish("once.topic", "again")
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, int32(1), count.Load())
+}
+
+func Test_EventBusSubscribeOnce_WithContext(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count atomic.Int32
+	require.NoError(t, bus.SubscribeOnce("ctx.once", func(ctx context.Context, topic string, payload any) {
+		if ctx != nil {
+			count.Add(1)
+		}
+	}))
+
+	_ = bus.PublishWithContext(context.Background(), "ctx.once", "payload")
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, int32(1), count.Load())
+
+	// 再次发布确认不会重复
+	_ = bus.Publish("ctx.once", "again")
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, int32(1), count.Load())
+}
+
+func Test_EventBusSubscribeOnce_PanicSafeUnsubscribe(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	require.NoError(t, bus.SubscribeOnce("panic.once", func(topic string, payload any) {
+		panic("boom")
+	}))
+
+	require.NoError(t, bus.PublishSync("panic.once", "payload"))
+
+	// 再次发布不应再触发 panic，且返回应为成功
+	require.NoError(t, bus.PublishSync("panic.once", "second"))
+}
+
+func Test_EventBusSubscribeOnce_Wildcard(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count atomic.Int32
+	require.NoError(t, bus.SubscribeOnce("a/#", func(topic string, payload any) {
+		count.Add(1)
+	}))
+
+	require.NoError(t, bus.PublishSync("a/b/c", "payload"))
+	require.NoError(t, bus.PublishSync("a/x", "again"))
+	assert.Equal(t, int32(1), count.Load())
 }
 
 func Test_EventBusContextPublish(t *testing.T) {
@@ -635,7 +845,7 @@ func Test_EventBusAsyncPublish(t *testing.T) {
 	}))
 
 	// 异步发布多条消息
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		err := bus.Publish("test", i)
 		assert.NoError(t, err)
 	}
@@ -653,15 +863,13 @@ func BenchmarkEventBusPublish(b *testing.B) {
 
 	b.ResetTimer()
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		for i := 0; i < b.N; i++ {
 			if err := bus.Publish("testtopic", i); err != nil {
 				panic(err)
 			}
 		}
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 	bus.Close()
 }
@@ -674,15 +882,13 @@ func BenchmarkEventBusPublishSync(b *testing.B) {
 
 	b.ResetTimer()
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		for i := 0; i < b.N; i++ {
 			if err := bus.PublishSync("testtopic", i); err != nil {
 				panic(err)
 			}
 		}
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 	bus.Close()
 }
@@ -692,14 +898,16 @@ func BenchmarkHighConcurrency(b *testing.B) {
 	topics := []string{"topic1", "topic2", "topic3"}
 
 	for _, topic := range topics {
-		if err := bus.Subscribe(topic, func(t string, p interface{}) {}); err != nil {
+		if err := bus.Subscribe(topic, func(t string, p any) {}); err != nil {
 			panic(err)
 		}
 	}
 
 	b.RunParallel(func(pb *testing.PB) {
+		i := 0
 		for pb.Next() {
-			topic := topics[len(topics)%3] // 简化随机选择
+			topic := topics[i%len(topics)]
+			i++
 			if err := bus.Publish(topic, "test"); err != nil {
 				panic(err)
 			}
@@ -791,7 +999,7 @@ func Test_EventBusTracer(t *testing.T) {
 	bus.SetTracer(tracer)
 
 	// 定义一个处理器变量以便重用
-	handler := func(topic string, msg interface{}) {}
+	handler := func(topic string, msg any) {}
 
 	// 测试订阅
 	err := bus.Subscribe("test", handler)
@@ -840,11 +1048,29 @@ func TestEventBusOnComplete(t *testing.T) {
 	}
 }
 
+func TestMetricsTracerErrorCounting(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	tracer := NewMetricsTracer()
+	bus.SetTracer(tracer)
+
+	// 发布到有 panic 的处理器
+	require.NoError(t, bus.Subscribe("panic.topic", func(topic string, payload any) {
+		panic("boom")
+	}))
+	_ = bus.PublishSync("panic.topic", "payload")
+
+	metrics := tracer.GetMetrics()
+	assert.EqualValues(t, 1, metrics["error_count"])
+	assert.EqualValues(t, 1, metrics["message_count"])
+}
+
 func Test_EventBusClose(t *testing.T) {
 	bus := New()
 
 	// 订阅一些处理器
-	err := bus.Subscribe("test", func(topic string, msg interface{}) {})
+	err := bus.Subscribe("test", func(topic string, msg any) {})
 	assert.Nil(t, err)
 
 	// 发布一些消息
@@ -856,10 +1082,12 @@ func Test_EventBusClose(t *testing.T) {
 
 	// 测试关闭后的操作
 	err = bus.Publish("test", "message")
-	assert.Equal(t, ErrChannelClosed, err)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrEventBusClosed))
 
-	err = bus.Subscribe("test", func(topic string, msg interface{}) {})
-	assert.Equal(t, ErrChannelClosed, err)
+	err = bus.Subscribe("test", func(topic string, msg any) {})
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrEventBusClosed))
 }
 
 func Test_EventBusHealthCheck(t *testing.T) {
@@ -874,19 +1102,20 @@ func Test_EventBusHealthCheck(t *testing.T) {
 
 	// 测试关闭后的状态
 	err = bus.HealthCheck()
-	assert.Equal(t, ErrChannelClosed, err)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrEventBusClosed))
 }
 
 // Mock 实现
 type mockTracer struct{}
 
-func (m *mockTracer) OnSubscribe(topic string, handler interface{})                     {}
-func (m *mockTracer) OnUnsubscribe(topic string, handler interface{})                   {}
-func (m *mockTracer) OnPublish(topic string, msg interface{}, metadata PublishMetadata) {}
-func (m *mockTracer) OnError(topic string, err error)                                   {}
-func (m *mockTracer) OnQueueFull(topic string, queueSize int)                           {}
-func (m *mockTracer) OnSlowConsumer(topic string, latency time.Duration)                {}
-func (m *mockTracer) OnComplete(topic string, metadata CompleteMetadata)                {}
+func (m *mockTracer) OnSubscribe(topic string, handler any)                     {}
+func (m *mockTracer) OnUnsubscribe(topic string, handler any)                   {}
+func (m *mockTracer) OnPublish(topic string, msg any, metadata PublishMetadata) {}
+func (m *mockTracer) OnError(topic string, err error)                           {}
+func (m *mockTracer) OnQueueFull(topic string, queueSize int)                   {}
+func (m *mockTracer) OnSlowConsumer(topic string, latency time.Duration)        {}
+func (m *mockTracer) OnComplete(topic string, metadata CompleteMetadata)        {}
 
 type recordingTracer struct {
 	completeCh chan CompleteMetadata
@@ -909,4 +1138,170 @@ func (r *recordingTracer) OnComplete(topic string, metadata CompleteMetadata) {
 	case r.completeCh <- metadata:
 	default:
 	}
+}
+
+func TestUnsubscribeAllRemovesTopicFromQueries(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	handler := func(topic string, payload any) {}
+	require.NoError(t, bus.Subscribe("cleanup.topic", handler))
+	require.True(t, bus.HasSubscribers("cleanup.topic"))
+	assert.Contains(t, bus.GetTopics(), "cleanup.topic")
+
+	require.NoError(t, bus.UnsubscribeAll("cleanup.topic"))
+
+	count, err := bus.GetSubscriberCount("cleanup.topic")
+	require.NoError(t, err)
+	assert.Equal(t, 0, count)
+	assert.False(t, bus.HasSubscribers("cleanup.topic"))
+	assert.NotContains(t, bus.GetTopics(), "cleanup.topic")
+	assert.Equal(t, 0, bus.channels.Len())
+}
+
+func TestUnsubscribeAll_AllowsResubscribeWildcardTopic(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count int32
+	handler := func(topic string, payload any) {
+		atomic.AddInt32(&count, 1)
+	}
+
+	require.NoError(t, bus.Subscribe("user.*", handler))
+	require.NoError(t, bus.UnsubscribeAll("user.*"))
+	require.NoError(t, bus.Subscribe("user.*", handler))
+	require.NoError(t, bus.PublishSync("user.created", "payload"))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&count))
+}
+
+func TestSubscribeWithFilter_CanUnsubscribeOriginalHandler(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count int32
+	handler := func(topic string, payload any) {
+		atomic.AddInt32(&count, 1)
+	}
+	filter := &testFilter{filterFunc: func(topic string, payload any) bool { return true }}
+
+	require.NoError(t, bus.SubscribeWithFilter("filter.topic", handler, filter))
+	require.NoError(t, bus.Unsubscribe("filter.topic", handler))
+	require.NoError(t, bus.PublishSync("filter.topic", "payload"))
+	assert.Equal(t, int32(0), atomic.LoadInt32(&count))
+}
+
+func TestSubscribeWithFilter_ContextHandlerCanUnsubscribeOriginalHandler(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count int32
+	handler := func(ctx context.Context, topic string, payload any) {
+		atomic.AddInt32(&count, 1)
+	}
+	filter := &testFilter{filterFunc: func(topic string, payload any) bool { return true }}
+
+	require.NoError(t, bus.SubscribeWithFilter("filter.ctx", handler, filter))
+	require.NoError(t, bus.Unsubscribe("filter.ctx", handler))
+	require.NoError(t, bus.PublishSyncWithContext(context.Background(), "filter.ctx", "payload"))
+	assert.Equal(t, int32(0), atomic.LoadInt32(&count))
+}
+
+func TestSubscribeWithFilter_FilterPanicIsReportedAndHandlerSkipped(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var count int32
+	handler := func(topic string, payload any) {
+		atomic.AddInt32(&count, 1)
+	}
+	filter := &testFilter{filterFunc: func(topic string, payload any) bool {
+		panic("boom")
+	}}
+
+	require.NoError(t, bus.SubscribeWithFilter("filter.panic", handler, filter))
+	require.NoError(t, bus.PublishSync("filter.panic", "payload"))
+	assert.Equal(t, int32(0), atomic.LoadInt32(&count))
+}
+
+func TestPublishSyncAnyValue_ReturnsFirstSuccessResult(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	slowCanceled := make(chan struct{}, 1)
+	require.NoError(t, bus.SubscribeWithResponseContext("value.topic", func(ctx context.Context, topic string, payload any) (any, error) {
+		<-ctx.Done()
+		slowCanceled <- struct{}{}
+		return nil, ctx.Err()
+	}))
+	require.NoError(t, bus.SubscribeWithResponse("value.topic", func(topic string, payload any) (any, error) {
+		return "fast-value", nil
+	}))
+
+	start := time.Now()
+	value, err := bus.PublishSyncAnyValue("value.topic", "payload")
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	assert.Equal(t, "fast-value", value)
+	assert.Less(t, elapsed, 500*time.Millisecond)
+
+	select {
+	case <-slowCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("慢处理器未被取消")
+	}
+}
+
+func TestTopicGroupPublishSyncAnyValueWithContext(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	group := bus.NewGroup("notify")
+	require.NoError(t, group.SubscribeWithResponseContext("email", func(ctx context.Context, topic string, payload any) (any, error) {
+		return ctx.Value("channel"), nil
+	}))
+
+	ctx := context.WithValue(context.Background(), "channel", "email")
+	value, err := group.PublishSyncAnyValueWithContext(ctx, "email", "payload")
+	require.NoError(t, err)
+	assert.Equal(t, "email", value)
+}
+
+func TestSingletonPublishSyncAnyValue(t *testing.T) {
+	ResetSingleton()
+	defer Close()
+
+	require.NoError(t, SubscribeWithResponse("singleton.value", func(topic string, payload any) (any, error) {
+		return "singleton-ok", nil
+	}))
+
+	value, err := PublishSyncAnyValue("singleton.value", "payload")
+	require.NoError(t, err)
+	assert.Equal(t, "singleton-ok", value)
+}
+
+func TestSubscribeWithFilter_PanicIsTracedAndHandlerSkipped(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var called int32
+	tracer := &testTracer{}
+	var traced atomic.Bool
+	tracer.onError = func(topic string, err error) {
+		if strings.Contains(err.Error(), "filter panic") {
+			traced.Store(true)
+		}
+	}
+	bus.SetTracer(tracer)
+
+	require.NoError(t, bus.SubscribeWithFilter("filter.panic", func(topic string, payload any) {
+		atomic.AddInt32(&called, 1)
+	}, &testFilter{filterFunc: func(topic string, payload any) bool {
+		panic("boom")
+	}}))
+
+	require.NoError(t, bus.PublishSync("filter.panic", "payload"))
+	assert.Equal(t, int32(0), atomic.LoadInt32(&called))
+	assert.True(t, traced.Load())
 }

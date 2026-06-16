@@ -60,7 +60,7 @@ func TestOptimizedEventBus_ContextPublish(t *testing.T) {
 	}))
 
 	// 先填满缓冲区
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		err := bus.Publish("test", fmt.Sprintf("message-%d", i))
 		if err != nil && !errors.Is(err, ErrPublishTimeout) {
 			require.NoError(t, err)
@@ -101,7 +101,7 @@ func TestOptimizedEventBus_AsyncPublish(t *testing.T) {
 	}))
 
 	// 异步发布多条消息
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		err := bus.Publish("test", i)
 		assert.NoError(t, err)
 	}
@@ -197,7 +197,7 @@ func TestOptimizedEventBus_HealthCheck(t *testing.T) {
 	bus.Close()
 	err = bus.HealthCheck()
 	assert.Error(t, err)
-	assert.Equal(t, ErrChannelClosed, err)
+	assert.Equal(t, ErrEventBusClosed, err)
 }
 
 func TestOptimizedEventBus_Stats(t *testing.T) {
@@ -294,7 +294,7 @@ func TestOptimizedSingleton_ThreadSafety(t *testing.T) {
 	const numGoroutines = 100
 
 	// 并发访问单例
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
