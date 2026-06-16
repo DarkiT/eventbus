@@ -20,7 +20,8 @@ type IMiddleware interface {
 	After(topic string, payload any)
 }
 
-// Subscription 定义带优先级的订阅信息
+// Subscription 定义带优先级的订阅信息。
+// 为兼容历史版本保留该导出类型。
 type Subscription struct {
 	Handler  any
 	Priority int
@@ -44,6 +45,8 @@ type SmartFilter struct {
 	counters map[string]*smartCounter
 	blocked  map[string]struct{}
 	window   time.Duration
+	stopCh   chan struct{}
+	stopped  bool
 }
 
 type smartCounter struct {
@@ -58,6 +61,64 @@ func NewSmartFilter() *SmartFilter {
 		counters: make(map[string]*smartCounter),
 		blocked:  make(map[string]struct{}),
 		window:   time.Minute,
+		stopCh:   make(chan struct{}),
+	}
+}
+
+// StartCleanup 启动后台清理协程，定期清理过期计数器。
+//
+// 注意：该协程独立于 EventBus 生命周期，bus.Close 不会自动停止它。
+// SmartFilter 不再使用时必须显式调用 Stop 释放，否则会造成 goroutine 泄漏。
+func (f *SmartFilter) StartCleanup(interval time.Duration) {
+	if f == nil || interval <= 0 {
+		return
+	}
+	f.mu.Lock()
+	if f.stopped {
+		f.mu.Unlock()
+		return
+	}
+	f.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				f.cleanup()
+			case <-f.stopCh:
+				return
+			}
+		}
+	}()
+}
+
+// cleanup 清理过期的计数器
+func (f *SmartFilter) cleanup() {
+	if f == nil {
+		return
+	}
+	now := time.Now()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for topic, counter := range f.counters {
+		if now.Sub(counter.windowStart) >= f.window {
+			delete(f.counters, topic)
+		}
+	}
+}
+
+// Stop 停止后台清理协程
+func (f *SmartFilter) Stop() {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.stopped {
+		f.stopped = true
+		close(f.stopCh)
 	}
 }
 
@@ -66,7 +127,10 @@ func (f *SmartFilter) SetLimit(topic string, limit int) {
 	if f == nil {
 		return
 	}
-	normalized := normalizeTopic(topic)
+	normalized, err := normalizeTopic(topic)
+	if err != nil {
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if limit <= 0 {
@@ -82,7 +146,10 @@ func (f *SmartFilter) BlockTopic(topic string) {
 	if f == nil {
 		return
 	}
-	normalized := normalizeTopic(topic)
+	normalized, err := normalizeTopic(topic)
+	if err != nil {
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.blocked[normalized] = struct{}{}
@@ -93,7 +160,10 @@ func (f *SmartFilter) UnblockTopic(topic string) {
 	if f == nil {
 		return
 	}
-	normalized := normalizeTopic(topic)
+	normalized, err := normalizeTopic(topic)
+	if err != nil {
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.blocked, normalized)
@@ -117,7 +187,10 @@ func (f *SmartFilter) Filter(topic string, payload any) bool {
 	if f == nil {
 		return true
 	}
-	normalized := normalizeTopic(topic)
+	normalized, err := normalizeTopic(topic)
+	if err != nil {
+		return true
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -175,7 +248,11 @@ func (m *Middleware) SetTransformer(fn func(topic string, payload any) any) {
 	m.mu.Unlock()
 }
 
-// Before 记录开始时间，可选地转换负载
+// Before 记录开始时间，可选地转换负载。
+//
+// 注意：耗时统计基于 per-topic 的 FIFO 队列配对。在多 goroutine 并发发布同一 topic
+// 且投递耗时不一时，Before/After 的配对顺序可能交错，统计为近似值，适用于趋势观测
+// 而非精确基准。如需精确计时，请在处理器内部自行埋点。
 func (m *Middleware) Before(topic string, payload any) any {
 	if m == nil {
 		return payload
@@ -215,6 +292,25 @@ func (m *Middleware) After(topic string, payload any) {
 	stat.Count++
 	stat.TotalTime += now.Sub(start)
 	m.mu.Unlock()
+}
+
+// MiddlewareFunc 适配器，便于测试快速注入 Before/After
+type MiddlewareFunc struct {
+	BeforeFn func(topic string, payload any) any
+	AfterFn  func(topic string, payload any)
+}
+
+func (m MiddlewareFunc) Before(topic string, payload any) any {
+	if m.BeforeFn != nil {
+		return m.BeforeFn(topic, payload)
+	}
+	return payload
+}
+
+func (m MiddlewareFunc) After(topic string, payload any) {
+	if m.AfterFn != nil {
+		m.AfterFn(topic, payload)
+	}
 }
 
 // GetStats 获取性能统计快照

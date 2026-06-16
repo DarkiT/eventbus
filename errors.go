@@ -38,10 +38,16 @@ var (
 
 	// ErrEventBusClosed 当事件总线已关闭时返回
 	ErrEventBusClosed = errors.New("event bus is closed")
+
+	// ErrShuttingDown 当事件总线正在优雅关闭（Shutdown）且不再接收新消息时返回
+	ErrShuttingDown = errors.New("event bus is shutting down")
+
+	// ErrDuplicateHandler 当处理器 ID 重复时返回
+	ErrDuplicateHandler = errors.New("duplicate handler ID")
 )
 
 // WrapError 用附加的上下文信息包装错误
-func WrapError(err error, format string, args ...interface{}) error {
+func WrapError(err error, format string, args ...any) error {
 	if err == nil {
 		return nil
 	}
