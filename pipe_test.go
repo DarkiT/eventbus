@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,14 +99,12 @@ func Test_PipePublish(t *testing.T) {
 	time.Sleep(time.Millisecond)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		for i := 0; i < 1000; i++ {
+	wg.Go(func() {
+		for i := range 1000 {
 			err := p.Publish(i)
 			assert.Nil(t, err)
 		}
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 
 	p.Close()
@@ -122,19 +121,54 @@ func Test_PipePublishSync(t *testing.T) {
 	time.Sleep(time.Millisecond)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		for i := 0; i < 1000; i++ {
+	wg.Go(func() {
+		for i := range 1000 {
 			err := p.PublishSync(i)
 			assert.Nil(t, err)
 		}
-		wg.Done()
-	}()
+	})
 	wg.Wait()
 
 	p.Close()
 	err := p.PublishSync(1)
 	assert.Equal(t, ErrChannelClosed, err)
+}
+
+func Test_PipeSubscribeOnce_Concurrent(t *testing.T) {
+	p := NewPipe[int]()
+	defer p.Close()
+
+	var count atomic.Int32
+	assert.NoError(t, p.SubscribeOnce(func(v int) {
+		count.Add(1)
+	}))
+
+	var wg sync.WaitGroup
+	const concurrency = 200
+	wg.Add(concurrency)
+	for i := range concurrency {
+		go func() {
+			defer wg.Done()
+			_ = p.Publish(i)
+		}()
+	}
+	wg.Wait()
+	time.Sleep(20 * time.Millisecond)
+
+	assert.Equal(t, int32(1), count.Load())
+
+	// 再次发送不会重复
+	_ = p.PublishSync(999)
+	time.Sleep(10 * time.Millisecond)
+	assert.Equal(t, int32(1), count.Load())
+}
+
+func Test_PipeSubscribeOnce_WhenClosed(t *testing.T) {
+	p := NewPipe[int]()
+	p.Close()
+
+	err := p.SubscribeOnce(func(v int) {})
+	assert.ErrorIs(t, err, ErrChannelClosed)
 }
 
 func Test_PipeClose(t *testing.T) {
@@ -151,16 +185,14 @@ func Test_PipeClose(t *testing.T) {
 }
 
 func TestPipeCloseConcurrentPublishDoesNotPanic(t *testing.T) {
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		p := NewPipe[int]()
 
 		panicCh := make(chan any, 1)
 		errCh := make(chan error, 1)
 
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			var err error
 			defer func() {
 				if r := recover(); r != nil {
@@ -169,7 +201,7 @@ func TestPipeCloseConcurrentPublishDoesNotPanic(t *testing.T) {
 				errCh <- err
 			}()
 			err = p.Publish(i)
-		}()
+		})
 
 		time.Sleep(50 * time.Microsecond)
 		p.Close()

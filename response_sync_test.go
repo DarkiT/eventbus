@@ -1,12 +1,15 @@
 package eventbus
 
 import (
+	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSubscribeWithResponse(t *testing.T) {
@@ -158,6 +161,45 @@ func TestPublishSyncAll_NoHandlers(t *testing.T) {
 	assert.Len(t, result.Results, 0)
 }
 
+func TestPublishSyncAny_NoHandlers(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	result, err := bus.PublishSyncAny("nonexistent.topic", "test_payload")
+	assert.NoError(t, err)
+	require.NotNil(t, result)
+
+	assert.False(t, result.Success)
+	assert.Equal(t, 0, result.HandlerCount)
+	assert.Equal(t, 0, result.SuccessCount)
+	assert.Equal(t, 0, result.FailureCount)
+	assert.Len(t, result.Results, 0)
+}
+
+func TestPublishSyncAnyWithContextCancelDoesNotHideCompletedResult(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fastDone := make(chan struct{})
+	require.NoError(t, bus.SubscribeWithResponseContextAndPriority("test.any.cancel", func(ctx context.Context, topic string, payload any) (any, error) {
+		close(fastDone)
+		return "fast", nil
+	}, 1))
+	require.NoError(t, bus.SubscribeWithResponseContextAndPriority("test.any.cancel", func(ctx context.Context, topic string, payload any) (any, error) {
+		<-fastDone
+		cancel()
+		time.Sleep(20 * time.Millisecond)
+		return "slow", nil
+	}, -1))
+
+	result, err := bus.PublishSyncAnyWithContext(ctx, "test.any.cancel", "payload")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Success)
+	assert.GreaterOrEqual(t, result.SuccessCount, 1)
+}
+
 func TestPublishSyncAll_HandlerPanic(t *testing.T) {
 	bus := New()
 	defer bus.Close()
@@ -194,6 +236,96 @@ func TestPublishSyncAll_HandlerPanic(t *testing.T) {
 		}
 	}
 	assert.True(t, panicFound, "应该找到panic处理器的错误")
+}
+
+func TestPublishSyncAll_PriorityOrder(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	// 高优先级处理器
+	require.NoError(t, bus.SubscribeWithResponseAndPriority("priority.topic", func(topic string, payload any) (any, error) {
+		return "p10", nil
+	}, 10))
+
+	// 低优先级处理器
+	require.NoError(t, bus.SubscribeWithResponseAndPriority("priority.*", func(topic string, payload any) (any, error) {
+		return "p1", nil
+	}, 1))
+
+	result, err := bus.PublishSyncAll("priority.topic", "payload")
+	require.NoError(t, err)
+	require.Len(t, result.Results, 2)
+	assert.Equal(t, "p10", result.Results[0].Result)
+	assert.Equal(t, "p1", result.Results[1].Result)
+}
+
+func TestSetTimeoutAffectsSyncPublish(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	bus.SetTimeout(30 * time.Millisecond)
+
+	require.NoError(t, bus.SubscribeWithResponse("timeout.topic", func(topic string, payload any) (any, error) {
+		time.Sleep(80 * time.Millisecond)
+		return "late", nil
+	}))
+
+	_, err := bus.PublishSyncAll("timeout.topic", "payload")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPublishTimeout)
+}
+
+func TestPublishSyncAll_FilterBlocks(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	var called atomic.Int32
+	bus.AddFilter(FilterFunc(func(topic string, payload any) bool {
+		return false
+	}))
+
+	require.NoError(t, bus.SubscribeWithResponse("filter.topic", func(topic string, payload any) (any, error) {
+		called.Add(1)
+		return "ok", nil
+	}))
+
+	result, err := bus.PublishSyncAll("filter.topic", "payload")
+	require.NoError(t, err)
+
+	assert.True(t, result.Success)
+	assert.Equal(t, 0, result.HandlerCount)
+	assert.Equal(t, int32(0), called.Load())
+}
+
+func TestPublishSyncAll_MiddlewareApplied(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	mwCall := atomic.Int32{}
+	bus.Use(&testMiddleware{
+		beforeFunc: func(topic string, payload any) any {
+			mwCall.Add(1)
+			if s, ok := payload.(string); ok {
+				return s + "_mw"
+			}
+			return payload
+		},
+		afterFunc: func(topic string, payload any) {
+			mwCall.Add(1)
+		},
+	})
+
+	var got string
+	require.NoError(t, bus.SubscribeWithResponse("middleware.topic", func(topic string, payload any) (any, error) {
+		got = payload.(string)
+		return payload, nil
+	}))
+
+	result, err := bus.PublishSyncAll("middleware.topic", "origin")
+	require.NoError(t, err)
+	assert.True(t, result.Success)
+	assert.Equal(t, "origin_mw", got)
+	assert.Equal(t, int32(2), mwCall.Load())
 }
 
 func TestPublishSyncAll_WithMQTTWildcard(t *testing.T) {
@@ -376,6 +508,46 @@ func BenchmarkPublishSyncAll_vs_PublishSync(b *testing.B) {
 	})
 }
 
+func BenchmarkPublishSyncAll_vs_PublishSync_FrameworkOnly(b *testing.B) {
+	// 纯框架开销对比：不引入业务 sleep 或额外对象构造
+	bus := New()
+	defer bus.Close()
+
+	for range 10 {
+		err := bus.Subscribe("traditional.framework.topic", func(topic string, payload any) {})
+		if err != nil {
+			b.Fatalf("订阅失败: %v", err)
+		}
+	}
+
+	for range 10 {
+		err := bus.SubscribeWithResponse("response.framework.topic", func(topic string, payload any) (any, error) {
+			return 1, nil
+		})
+		if err != nil {
+			b.Fatalf("响应式订阅失败: %v", err)
+		}
+	}
+
+	b.Run("TraditionalPublishSync_NoWork", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			err := bus.PublishSync("traditional.framework.topic", "payload")
+			if err != nil {
+				b.Fatalf("PublishSync 失败: %v", err)
+			}
+		}
+	})
+
+	b.Run("NewPublishSyncAll_NoWork", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			result, err := bus.PublishSyncAll("response.framework.topic", "payload")
+			if err != nil || !result.Success {
+				b.Fatalf("PublishSyncAll 失败: %v", err)
+			}
+		}
+	})
+}
+
 func BenchmarkConcurrentPublishSyncAll(b *testing.B) {
 	bus := New()
 	defer bus.Close()
@@ -401,4 +573,65 @@ func BenchmarkConcurrentPublishSyncAll(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestPublishSyncAny_WithCallerCanceledContext_IsNotMaskedByLaterSuccess(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	require.NoError(t, bus.SubscribeWithResponse("cancel.topic", func(topic string, payload any) (any, error) {
+		time.Sleep(20 * time.Millisecond)
+		return "late-success", nil
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, err := bus.PublishSyncAnyWithContext(ctx, "cancel.topic", "payload")
+	assert.Nil(t, result)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestPublishSyncAny_NonCooperativeHandlerExceedsTimeout(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+	bus.SetTimeout(20 * time.Millisecond)
+
+	require.NoError(t, bus.SubscribeWithResponse("slow.any", func(topic string, payload any) (any, error) {
+		time.Sleep(60 * time.Millisecond)
+		return "done", nil
+	}))
+
+	start := time.Now()
+	result, err := bus.PublishSyncAny("slow.any", "payload")
+	elapsed := time.Since(start)
+
+	assert.Nil(t, result)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPublishTimeout)
+	assert.Less(t, elapsed, 60*time.Millisecond)
+}
+
+func TestPublishSyncAnyValueWithContext_FastReturnOnSuccess(t *testing.T) {
+	bus := New()
+	defer bus.Close()
+
+	require.NoError(t, bus.SubscribeWithResponseContext("fast.value", func(ctx context.Context, topic string, payload any) (any, error) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+			return nil, errors.New("too slow")
+		}
+	}))
+	require.NoError(t, bus.SubscribeWithResponse("fast.value", func(topic string, payload any) (any, error) {
+		return "ok", nil
+	}))
+
+	start := time.Now()
+	value, err := bus.PublishSyncAnyValueWithContext(context.Background(), "fast.value", "payload")
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", value)
+	assert.Less(t, elapsed, 250*time.Millisecond)
 }
