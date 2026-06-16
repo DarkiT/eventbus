@@ -26,6 +26,7 @@ EventBus 是一个高性能的 Go 事件总线库，基于优化的写时复制(
 - 🔎 **主题查询API** - GetTopics、GetSubscriberCount、HasSubscribers
 - 🔁 **可靠投递与重试** - SubscribeReliable 支持失败自动重试（指数/jitter 退避）、可重试错误过滤与死信回调
 - 🛑 **优雅关闭** - Shutdown 等待已接收发布并排空队列后再关闭，Close 立即关闭，适用于平滑发版/重启
+- 🔌 **外部系统适配器** - Bridge / Transport / Codec 三层抽象，消息编解码、去重和上下文透传
 
 ## 📦 安装
 
@@ -999,6 +1000,7 @@ func (t *ErrorRecoveryTracer) OnError(topic string, err error) {
 
 - [完整功能示例](examples/full/main.go) - 包括优先级订阅、通配符匹配、错误处理、泛型管道、全局单例、中间件和过滤器
 - [响应式发布示例](examples/response/main.go) - PublishSyncAll/PublishSyncAny 完整演示
+- [适配器使用示例](adapter/README.md) - Bridge 桥接外部系统的完整示例
 
 ```bash
 # 运行完整示例
@@ -1042,56 +1044,93 @@ make help
 ```text
 eventbus/
 ├── README.md              # 项目说明
-├── go.mod                 # Go模块定义
-├── *.go                   # 核心源码文件
-├── *_test.go              # 单元测试文件
+├── CHANGELOG.md           # 版本变更日志
+├── golangci.yml           # 代码质量检查配置
+├── go.mod / go.sum        # Go 模块定义和依赖
+├── doc.go                 # 包级文档注释
+├── eventbus*.go           # EventBus 核心模块（admin/batch/channel/helpers/match/publish/response/subscribe）
+├── retry.go               # 重试机制
+├── topic_trie.go          # 通配符匹配树
+├── pipe*.go               # 泛型管道
+├── cowmap*.go             # 写时复制 Map
+├── group*.go              # 主题分组
+├── singleton*.go          # 全局单例
+├── tracer*.go             # 事件追踪器
+├── interfaces.go          # 接口定义
+├── errors.go              # 错误类型
+├── *_test.go              # 单元测试/基准测试文件
+├── adapter/               # 外部系统适配器
+│   ├── README.md          # 适配器使用说明
+│   ├── DESIGN.md          # 设计文档
+│   ├── bridge.go          # 事件桥接器
+│   ├── transport.go       # 传输抽象层
+│   ├── codec.go           # 消息编解码
+│   ├── message.go         # 消息模型
+│   ├── context.go         # 请求上下文
+│   ├── dedupe.go          # 消息去重
+│   └── options.go         # 可配置选项
 ├── examples/              # 使用示例
-│   ├── full/             # 完整功能示例
-│   │   ├── main.go       # 完整示例代码
-│   │   └── main_test.go  # 示例测试
-│   └── response/         # 响应式发布示例
-│       └── main.go       # 响应式示例代码
+│   ├── full/              # 完整功能示例
+│   │   ├── main.go        # 完整示例代码
+│   │   └── main_test.go   # 示例测试
+│   └── response/          # 响应式发布示例
+│       └── main.go        # 响应式示例代码
 ├── docs/                  # 项目文档
-│   ├── images/           # 架构图表
-│   │   ├── 架构图.md     # 系统架构图
-│   │   ├── 流程图.md     # 业务流程图
-│   │   └── 时序图.md     # 时序交互图
-│   ├── EventBus全面评估报告.md # 代码质量评估
-│   ├── 评估报告-执行摘要.md # 项目执行摘要
-│   ├── ToDos.md          # 任务清单
-│   ├── MQTT_COMPATIBILITY.md  # MQTT兼容性文档
-│   └── PublishSync响应式设计评估.md  # 响应式发布设计文档
-└── Makefile              # 构建脚本
+│   ├── API接口设计.md      # API 接口设计文档
+│   ├── ARCHITECTURE.md    # 架构设计文档
+│   ├── MQTT_COMPATIBILITY.md  # MQTT 兼容性文档
+│   ├── RELEASE_NOTES.md   # 发布说明
+│   ├── images/            # 架构图表
+│   │   ├── 架构图.md      # 系统架构图
+│   │   ├── 流程图.md      # 业务流程图
+│   │   └── 时序图.md      # 时序交互图
+│   └── skills/            # EventBus 技能文档
+│       └── eventbus/
+│           ├── SKILL.md
+│           ├── assets/
+│           └── references/
+└── Makefile               # 构建脚本
 ```
 
 ### 核心源码分层
 
-- `eventbus.go`：`EventBus` 骨架、trace/config 管理、总线级治理入口
-- `eventbus_channel.go`：内部 `channel` worker 生命周期、队列投递、处理器注册/退订
-- `eventbus_subscribe.go`：`Subscribe*` / `SubscribeOnce*` / filter 订阅入口
-- `eventbus_publish.go`：普通 `Publish*`、`deliverMessage`、filter/middleware 应用
-- `eventbus_batch.go`：`PublishBatch*`、批量分组与 ordinary handler 计数语义
-- `eventbus_match.go`：普通/响应处理器匹配聚合
-- `eventbus_response.go`：响应式同步发布核心收敛逻辑
-- `eventbus_response_api.go`：`PublishSyncAll` / `PublishSyncAny` / `PublishSyncAnyValue` 对外 facade
-- `eventbus_helpers.go`：handler 签名校验、`callHandler`、共享 helper
-- `eventbus_admin.go`：关闭、退订、统计、健康检查等管理接口
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| EventBus 骨架 | `eventbus.go` | 结构体定义、trace/config 管理、总线级治理入口 |
+| 通道管理 | `eventbus_channel.go` | 内部 channel worker 生命周期、队列投递、处理器注册/退订 |
+| 订阅入口 | `eventbus_subscribe.go` | `Subscribe*` / `SubscribeOnce*` / filter 订阅入口 |
+| 发布核心 | `eventbus_publish.go` | 普通 `Publish*`、`deliverMessage`、filter/middleware 应用 |
+| 批量操作 | `eventbus_batch.go` | `PublishBatch*`、批量分组与计数语义 |
+| 匹配聚合 | `eventbus_match.go` | 普通/响应处理器匹配聚合 |
+| 响应式发布 | `eventbus_response.go` | 响应式同步发布核心收敛逻辑 |
+| 响应 API | `eventbus_response_api.go` | `PublishSyncAll` / `PublishSyncAny` / `PublishSyncAnyValue` 对外 facade |
+| 辅助函数 | `eventbus_helpers.go` | handler 签名校验、`callHandler`、共享 helper |
+| 管理接口 | `eventbus_admin.go` | 关闭、退订、统计、健康检查等管理接口 |
+| 重试机制 | `retry.go` | 指数退避重试、可重试错误过滤、死信回调 |
+| 匹配树 | `topic_trie.go` | Trie 树通配符匹配、`+` / `#` 语义、混合分隔符 |
+| 泛型管道 | `pipe*.go` | 类型安全泛型管道、响应式处理器 |
+| 写时复制 | `cowmap*.go` | 高并发读优化 COW Map |
+| 主题分组 | `group*.go` | 层级化主题组、嵌套子组 |
+| 全局单例 | `singleton*.go` | 全局事件总线实例、生命周期管理 |
+| 事件追踪 | `tracer*.go` | 生命周期追踪、性能指标、错误监控 |
+| 接口定义 | `interfaces.go` | 核心接口类型定义 |
+| 错误类型 | `errors.go` | 标准化错误定义 |
+| 外部适配器 | `adapter/` | Bridge / Transport / Codec 三层抽象，桥接外部系统 |
 
 ## 📊 文档资源
 
 ### 架构设计文档
+- [架构设计文档](docs/ARCHITECTURE.md) - 完整架构方案与设计决策
 - [系统架构图](docs/images/架构图.md) - 系统整体架构和组件关系
 - [业务流程图](docs/images/流程图.md) - 关键业务流程详细说明
 - [时序图](docs/images/时序图.md) - 组件间交互时序关系
 
 ### 开发文档
-- [MQTT兼容性说明](docs/MQTT_COMPATIBILITY.md) - 完整的MQTT通配符支持文档
-- [响应式发布设计评估](docs/PublishSync响应式设计评估.md) - PublishSyncAll/PublishSyncAny技术设计文档
-- [性能评估报告](docs/性能评估报告.md) - 基准测试分析、性能瓶颈识别和优化建议
-- [EventBus全面评估报告](docs/EventBus全面评估报告.md) - 代码质量和性能全面分析
-- [评估报告-执行摘要](docs/评估报告-执行摘要.md) - 项目执行情况摘要
-- [API接口设计](docs/API接口设计.md) - API接口详细设计文档
-- [任务清单](docs/ToDos.md) - 开发任务和进度跟踪
+- [MQTT 兼容性说明](docs/MQTT_COMPATIBILITY.md) - 完整的 MQTT 通配符支持文档
+- [API 接口设计](docs/API接口设计.md) - API 接口详细设计文档
+- [发布说明](docs/RELEASE_NOTES.md) - 各版本发布说明
+- [变更日志](CHANGELOG.md) - 版本变更记录
+- [EventBus 技能文档](docs/skills/eventbus/) - 开发者使用指南和最佳实践
 
 ## 🤝 贡献指南
 
