@@ -62,6 +62,18 @@ func (e *EventBus) Subscribe(topic string, handler any) error
 // SubscribeWithPriority 带优先级订阅
 func (e *EventBus) SubscribeWithPriority(topic string, handler any, priority int) error
 
+// SubscribeOnce 一次性订阅，处理器仅执行一次后自动退订
+func (e *EventBus) SubscribeOnce(topic string, handler any) error
+
+// SubscribeOnceWithPriority 带优先级的一次性订阅
+func (e *EventBus) SubscribeOnceWithPriority(topic string, handler any, priority int) error
+
+// SubscribeWithFilter 订阅带过滤器的处理器
+func (e *EventBus) SubscribeWithFilter(topic string, handler any, filter EventFilter) error
+
+// SubscribeWithFilterAndPriority 订阅带过滤器和优先级的处理器
+func (e *EventBus) SubscribeWithFilterAndPriority(topic string, handler any, filter EventFilter, priority int) error
+
 // SubscribeWithResponse 响应式订阅（返回值 + 错误）
 func (e *EventBus) SubscribeWithResponse(topic string, handler ResponseHandler) error
 
@@ -110,6 +122,12 @@ func (e *EventBus) PublishSyncAny(topic string, payload any) (*SyncResult, error
 
 // PublishSyncAnyWithContext 响应式同步发布（任一成功，透传 context）
 func (e *EventBus) PublishSyncAnyWithContext(ctx context.Context, topic string, payload any) (*SyncResult, error)
+
+// PublishSyncAnyValue 快速返回首个成功处理器的结果
+func (e *EventBus) PublishSyncAnyValue(topic string, payload any) (any, error)
+
+// PublishSyncAnyValueWithContext 快速返回首个成功处理器的结果，透传 context
+func (e *EventBus) PublishSyncAnyValueWithContext(ctx context.Context, topic string, payload any) (any, error)
 ```
 
 **设计说明**:
@@ -118,7 +136,7 @@ func (e *EventBus) PublishSyncAnyWithContext(ctx context.Context, topic string, 
 - `PublishWithContext`/`PublishAsyncWithContext` 在投递前尊重 `ctx`（超时/取消），处理器会异步执行
 - `PublishSyncWithContext` 在整个处理链中尊重 `ctx`，适合需要可取消的同步工作流
 - 响应式同步接口汇总多个处理器返回值；当 `ctx` 未带超时时，会自动叠加默认超时（5 秒）以避免无限等待
-- `PublishSyncAny` 在任意处理器成功后立即取消剩余处理器，可降低平均延迟
+- `PublishSyncAny` 返回完整 `SyncResult`；若要真正首个成功即返回，请使用 `PublishSyncAnyValue` 变体
 
 #### 管理接口
 ```go
@@ -131,6 +149,9 @@ func (e *EventBus) Use(middleware Middleware)
 // SetTracer 设置事件追踪器
 func (e *EventBus) SetTracer(tracer EventTracer)
 
+// SetTimeout 动态调整总线级超时时间
+func (e *EventBus) SetTimeout(timeout time.Duration)
+
 // NewGroup 基于前缀创建主题组
 func (e *EventBus) NewGroup(prefix string) *TopicGroup
 
@@ -142,6 +163,15 @@ func (e *EventBus) HealthCheck() error
 
 // GetStats 获取统计信息
 func (e *EventBus) GetStats() map[string]interface{}
+
+// GetTopics 返回所有已注册的主题列表
+func (e *EventBus) GetTopics() []string
+
+// GetSubscriberCount 返回指定主题的订阅者数量
+func (e *EventBus) GetSubscriberCount(topic string) (int, error)
+
+// HasSubscribers 检查指定主题是否有订阅者
+func (e *EventBus) HasSubscribers(topic string) bool
 ```
 
 ### 泛型管道接口
@@ -208,7 +238,38 @@ func (p *Pipe[T]) SubscribeWithResponse(handler PipeResponseHandler[T]) (PipeRes
 
 // SubscribeWithResponseAndPriority 带优先级的响应式处理
 func (p *Pipe[T]) SubscribeWithResponseAndPriority(handler PipeResponseHandler[T], priority int) (PipeResponseCancel, error)
+
+// SubscribeWithResponseContext 兼容版 Context 响应式订阅
+func (p *Pipe[T]) SubscribeWithResponseContext(handler PipeResponseHandlerWithContext[T]) error
+
+// SubscribeWithResponseContextHandle 推荐版 Context 响应式订阅，返回取消句柄
+func (p *Pipe[T]) SubscribeWithResponseContextHandle(handler PipeResponseHandlerWithContext[T]) (PipeResponseCancel, error)
+
+// SubscribeWithResponseContextHandleAndPriority 推荐版 Context 响应式订阅（带优先级）
+func (p *Pipe[T]) SubscribeWithResponseContextHandleAndPriority(handler PipeResponseHandlerWithContext[T], priority int) (PipeResponseCancel, error)
+
+// PublishSyncAll / PublishSyncAny 直接返回完整结果
+func (p *Pipe[T]) PublishSyncAll(payload T) (*PipeSyncResult, error)
+func (p *Pipe[T]) PublishSyncAny(payload T) (*PipeSyncResult, error)
+
+// PublishSyncAllWithContext 便捷版：返回 map[handlerID]result
+func (p *Pipe[T]) PublishSyncAllWithContext(ctx context.Context, payload T) (map[string]any, error)
+
+// PublishSyncAllResultWithContext 结果版：返回完整 PipeSyncResult
+func (p *Pipe[T]) PublishSyncAllResultWithContext(ctx context.Context, payload T) (*PipeSyncResult, error)
+
+// PublishSyncAnyWithContext 便捷版：返回首个成功结果
+func (p *Pipe[T]) PublishSyncAnyWithContext(ctx context.Context, payload T) (any, error)
+
+// PublishSyncAnyResultWithContext 结果版：返回完整 PipeSyncResult
+func (p *Pipe[T]) PublishSyncAnyResultWithContext(ctx context.Context, payload T) (*PipeSyncResult, error)
 ```
+
+**Pipe 设计说明**：
+- `SubscribeWithResponseContextHandle*` 是推荐的上层调用方式，便于显式取消订阅。
+- `PublishSyncAllResultWithContext` / `PublishSyncAnyResultWithContext` 适合需要诊断、统计、错误明细的调用方。
+- `PublishSyncAllWithContext` / `PublishSyncAnyWithContext` 保留为轻量包装，适合上层只关心结果值。
+- 当 `ctx` 未设置 deadline 时，Pipe 会自动叠加自身 timeout，避免无限等待。
 
 ### 接口抽象
 
@@ -227,6 +288,8 @@ type SmartFilter struct {
     SetWindow(window time.Duration)
     BlockTopic(topic string)
     UnblockTopic(topic string)
+    StartCleanup(interval time.Duration)  // 启动后台清理协程
+    Stop()                                 // 停止后台清理协程
 }
 ```
 
@@ -489,4 +552,17 @@ pipe.Subscribe(func(event OrderEvent) {
 })
 
 pipe.Publish(OrderEvent{ID: "123", Status: "created"})
+
+cancel, _ := pipe.SubscribeWithResponseContextHandle(func(ctx context.Context, event OrderEvent) (any, error) {
+    return map[string]any{"id": event.ID, "status": event.Status}, nil
+})
+defer cancel()
+
+ctx, cancelCtx := context.WithTimeout(context.Background(), time.Second)
+defer cancelCtx()
+
+result, err := pipe.PublishSyncAllResultWithContext(ctx, OrderEvent{ID: "123", Status: "paid"})
+if err == nil && result.Success {
+    fmt.Printf("处理器数量: %d\n", result.HandlerCount)
+}
 ```

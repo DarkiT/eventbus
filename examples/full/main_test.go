@@ -15,7 +15,7 @@ func TestUserEvent(t *testing.T) {
 		UserID: "test123",
 		Action: "login",
 		Time:   time.Now(),
-		Metadata: map[string]interface{}{
+		Metadata: map[string]any{
 			"ip": "127.0.0.1",
 		},
 	}
@@ -106,14 +106,14 @@ func TestMiddleware(t *testing.T) {
 	require.NotNil(t, middleware)
 
 	// 测试处理map类型payload
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"data": "test",
 	}
 
 	processedPayload := middleware.Before("test.topic", payload)
 	assert.NotNil(t, processedPayload)
 
-	if payloadMap, ok := processedPayload.(map[string]interface{}); ok {
+	if payloadMap, ok := processedPayload.(map[string]any); ok {
 		assert.Contains(t, payloadMap, "_start_time")
 		assert.Equal(t, "test", payloadMap["data"])
 	}
@@ -132,7 +132,7 @@ func TestMiddleware(t *testing.T) {
 	stringPayload := "simple string"
 	wrappedPayload := middleware.Before("test.topic2", stringPayload)
 
-	if payloadMap, ok := wrappedPayload.(map[string]interface{}); ok {
+	if payloadMap, ok := wrappedPayload.(map[string]any); ok {
 		assert.Equal(t, stringPayload, payloadMap["_original_payload"])
 		assert.Contains(t, payloadMap, "_start_time")
 	}
@@ -287,6 +287,8 @@ func TestContextPublishing(t *testing.T) {
 }
 
 func TestGlobalSingleton(t *testing.T) {
+	eventbus.ResetSingleton()
+
 	// 测试全局单例功能
 	received := make(chan string, 5)
 
@@ -309,13 +311,19 @@ func TestGlobalSingleton(t *testing.T) {
 	err = eventbus.PublishWithContext(ctx, "global.test", "context message")
 	assert.NoError(t, err)
 
-	// 验证至少接收到同步消息
-	select {
-	case msg := <-received:
-		assert.Equal(t, "sync message", msg)
-	case <-time.After(time.Second):
-		t.Fatal("未接收到同步消息")
+	// 收集所有消息，验证同步消息被接收
+	var messages []string
+	deadline := time.After(2 * time.Second)
+loop:
+	for range 3 {
+		select {
+		case msg := <-received:
+			messages = append(messages, msg)
+		case <-deadline:
+			break loop
+		}
 	}
+	assert.Contains(t, messages, "sync message", "应接收到同步消息")
 
 	// 健康检查
 	err = eventbus.HealthCheck()

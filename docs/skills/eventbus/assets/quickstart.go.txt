@@ -1,0 +1,104 @@
+// quickstart.go —— eventbus 可运行示例（整合核心功能）
+//
+// 用法：把本文件复制为 main.go（或在 examples/ 下新建目录），go run 即可。
+// 所有 API 均经 github.com/darkit/eventbus 源码核验，可直接编译运行。
+//
+// 演示：基础订阅、优先级、响应式事务(PublishSyncAll)、容错(PublishSyncAnyValue)、
+//       Pipe[T]、通配符、SmartFilter、MetricsTracer、TopicGroup。
+
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/darkit/eventbus"
+)
+
+func main() {
+	bus := eventbus.New() // 无缓冲；高吞吐可用 eventbus.New(-1)
+	defer bus.Close()
+
+	// 1. 基础订阅发布（用 PublishSync 保证可观察）
+	_ = bus.Subscribe("user.created", func(topic string, payload any) {
+		fmt.Printf("[基础] %s: %v\n", topic, payload)
+	})
+	_ = bus.PublishSync("user.created", map[string]any{"id": 1, "name": "Alice"})
+
+	// 2. 优先级订阅（数字越大越先）
+	_ = bus.SubscribeWithPriority("log", func(string, any) { fmt.Println("[优先级] high(10)") }, 10)
+	_ = bus.SubscribeWithPriority("log", func(string, any) { fmt.Println("[优先级] low(1)") }, 1)
+	_ = bus.PublishSync("log", nil)
+
+	// 3. 事务编排：全部成功才算成功
+	_ = bus.SubscribeWithResponse("order.submit", func(string, any) (any, error) {
+		return "库存OK", nil
+	})
+	_ = bus.SubscribeWithResponse("order.submit", func(string, any) (any, error) {
+		return "支付OK", nil
+	})
+	res, err := bus.PublishSyncAll("order.submit", "ORDER-001")
+	if err != nil {
+		fmt.Printf("[事务] 总线错误: %v\n", err)
+	} else if res.Success {
+		fmt.Printf("[事务] 全部成功: %d/%d, 耗时 %v\n", res.SuccessCount, res.HandlerCount, res.TotalTime)
+		for _, h := range res.Results {
+			fmt.Printf("       步骤返回: %v\n", h.Result)
+		}
+	}
+
+	// 4. 容错通知：任一成功即可，直接取首成功值
+	_ = bus.SubscribeWithResponse("notify", func(string, any) (any, error) { return "email", nil })
+	_ = bus.SubscribeWithResponse("notify", func(string, any) (any, error) { return "sms", nil })
+	first, err := bus.PublishSyncAnyValue("notify", "hello")
+	if err == nil {
+		fmt.Printf("[容错] 首个成功通道: %v\n", first)
+	}
+
+	// 5. 类型安全管道 Pipe[T]
+	pipe := eventbus.NewBufferedPipe[int](64) // 单参处理器，类型即 int
+	defer pipe.Close()
+	_ = pipe.Subscribe(func(v int) { fmt.Printf("[Pipe] 收到: %d\n", v) })
+	_ = pipe.Publish(42)
+
+	// 6. 通配符路由
+	_ = bus.Subscribe("sensor/+/temp", func(topic string, p any) {
+		fmt.Printf("[通配符 +] %s = %v\n", topic, p)
+	})
+	_ = bus.Subscribe("system/#", func(topic string, p any) {
+		fmt.Printf("[通配符 #] %s = %v\n", topic, p)
+	})
+	_ = bus.PublishSync("sensor/room1/temp", 25.5) // 命中 +
+	_ = bus.PublishSync("system/cpu/high", 88)      // 命中 #
+
+	// 7. SmartFilter 限流 + 阻断
+	filter := eventbus.NewSmartFilter()
+	filter.SetLimit("rate.limited", 2) // 每窗口（默认 1min）最多 2 次
+	filter.BlockTopic("debug.verbose") // 阻断该 topic 及子层级
+	bus.AddFilter(filter)
+
+	var hit int
+	_ = bus.Subscribe("rate.limited", func(string, any) { hit++ })
+	for i := 0; i < 5; i++ {
+		_ = bus.PublishSync("rate.limited", i) // 只有前 2 次触达
+	}
+	fmt.Printf("[Filter] 限流后实际触达: %d 次\n", hit)
+
+	// 8. MetricsTracer 指标
+	tracer := eventbus.NewMetricsTracer()
+	bus.SetTracer(tracer)
+	_ = bus.PublishSync("metric.test", nil)
+	m := tracer.GetMetrics()
+	fmt.Printf("[Tracer] 消息数: %v, 错误数: %v\n", m["message_count"], m["error_count"])
+
+	// 9. TopicGroup 多租户（前缀自动拼接）
+	tenant := bus.NewGroup("tenantA")
+	_ = tenant.Subscribe("order.created", func(topic string, p any) {
+		fmt.Printf("[Group] %s (前缀=%s)\n", topic, "tenantA")
+	})
+	_ = tenant.PublishSync("order.created", "ORDER-002")
+
+	// 给异步路径一点时间收尾（演示用；生产按需用 PublishSync/Close 等待）
+	time.Sleep(50 * time.Millisecond)
+	fmt.Println("✅ quickstart 完成")
+}

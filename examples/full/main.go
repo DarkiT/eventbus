@@ -19,10 +19,10 @@ func must(err error) {
 
 // 用户事件结构
 type UserEvent struct {
-	UserID   string                 `json:"user_id"`
-	Action   string                 `json:"action"`
-	Time     time.Time              `json:"time"`
-	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	UserID   string         `json:"user_id"`
+	Action   string         `json:"action"`
+	Time     time.Time      `json:"time"`
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // 系统指标事件
@@ -114,11 +114,11 @@ func (t *Tracer) OnSlowConsumer(topic string, latency time.Duration) {
 	log.Printf("[追踪器] 慢消费者 [%s]: 延迟 %v", topic, latency)
 }
 
-func (t *Tracer) GetStats() map[string]interface{} {
+func (t *Tracer) GetStats() map[string]any {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	stats := make(map[string]interface{})
+	stats := make(map[string]any)
 	for k, v := range t.metrics {
 		stats[k] = v
 	}
@@ -212,13 +212,13 @@ func (m *Middleware) Before(topic string, payload any) any {
 	}
 
 	// 在 payload 中添加开始时间
-	if payloadMap, ok := payload.(map[string]interface{}); ok {
+	if payloadMap, ok := payload.(map[string]any); ok {
 		payloadMap["_start_time"] = time.Now()
 		return payloadMap
 	}
 
 	// 如果不是 map，创建一个包装
-	return map[string]interface{}{
+	return map[string]any{
 		"_original_payload": payload,
 		"_start_time":       time.Now(),
 	}
@@ -230,7 +230,7 @@ func (m *Middleware) After(topic string, payload any) {
 		log.Printf("[中间件] 完成处理: topic=%s", topic)
 	}
 
-	if payloadMap, ok := payload.(map[string]interface{}); ok {
+	if payloadMap, ok := payload.(map[string]any); ok {
 		if startTime, exists := payloadMap["_start_time"]; exists {
 			if start, ok := startTime.(time.Time); ok {
 				duration := time.Since(start)
@@ -327,13 +327,13 @@ func main() {
 		UserID: "user123",
 		Action: "login",
 		Time:   time.Now(),
-		Metadata: map[string]interface{}{
+		Metadata: map[string]any{
 			"ip":         "192.168.1.100",
 			"user_agent": "Mozilla/5.0...",
 		},
 	}
 
-	must(bus.PublishSync("user.login", map[string]interface{}{
+	must(bus.PublishSync("user.login", map[string]any{
 		"event": loginEvent,
 	}))
 
@@ -481,12 +481,12 @@ func main() {
 	start := time.Now()
 
 	// 启动多个 goroutine 并发发布
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < messagesPerGoroutine; j++ {
-				if err := bus.Publish("performance.test", map[string]interface{}{
+			for j := range messagesPerGoroutine {
+				if err := bus.Publish("performance.test", map[string]any{
 					"goroutine": id,
 					"message":   j,
 					"timestamp": time.Now(),
