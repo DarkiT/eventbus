@@ -38,6 +38,36 @@ func TestTopicGroup(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestNormalizeTopic(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		want      string
+		expectErr bool
+	}{
+		{"空字符串返回错误", "", "", true},
+		{"斜杠替换为点", "chat/room", "chat.room", false},
+		{"已标准化保持不变", "chat.room", "chat.room", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeTopic(tc.input)
+			if tc.expectErr {
+				assert.ErrorIs(t, err, ErrInvalidTopic)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	// 向后兼容合法主题：发布应成功
+	bus := New()
+	err := bus.Publish("chat/room", "hello")
+	assert.NoError(t, err)
+}
+
 func TestWildcardMatching(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -79,7 +109,11 @@ func TestWildcardMatching(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.match, matchTopic(tt.pattern, tt.topic),
+			trie := newTopicTrie()
+			trie.Insert(tt.pattern)
+			matches := trie.Match(tt.topic)
+			matched := len(matches) > 0
+			assert.Equal(t, tt.match, matched,
 				"模式 '%s' 匹配主题 '%s' 应该返回 %v", tt.pattern, tt.topic, tt.match)
 		})
 	}

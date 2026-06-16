@@ -1,7 +1,6 @@
 package eventbus
 
 import (
-	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +24,11 @@ type EventTracer interface {
 	OnSlowConsumer(topic string, latency time.Duration)
 }
 
+// ResponseAwareTracer 可选接口，区分响应式处理的慢消费者
+type ResponseAwareTracer interface {
+	OnSlowConsumerResponse(topic string, latency time.Duration)
+}
+
 // PublishMetadata 发布事件的元数据
 type PublishMetadata struct {
 	Timestamp   time.Time // 发布时间
@@ -44,10 +48,9 @@ type CompleteMetadata struct {
 
 // QueueStats 队列统计
 type QueueStats struct {
-	maxSize     atomic.Int64 // 最大队列大小
-	fullCount   atomic.Int64 // 队列满次数
-	avgSize     atomic.Int64 // 平均队列大小
-	sampleCount atomic.Int64 // 采样次数
+	maxSize   atomic.Int64 // 最大队列大小
+	fullCount atomic.Int64 // 队列满次数
+	avgSize   atomic.Int64 // 平均队列大小
 }
 
 // LatencyStats 延迟统计
@@ -66,7 +69,8 @@ type MetricsTracer struct {
 	processingTime  atomic.Int64             // 处理总时间(纳秒)
 	subscriberCount map[string]*atomic.Int32 // 每个主题的订阅者数量
 	queueStats      map[string]*QueueStats   // 每个主题的队列统计
-	latencyStats    map[string]*LatencyStats // 每个主题的延迟统计
+	latencyStats    map[string]*LatencyStats // 普通处理延迟统计
+	respLatency     map[string]*LatencyStats // 响应式处理延迟统计
 	slowThreshold   time.Duration            // 慢消费阈值
 }
 
@@ -76,6 +80,7 @@ func NewMetricsTracer() *MetricsTracer {
 		subscriberCount: make(map[string]*atomic.Int32),
 		queueStats:      make(map[string]*QueueStats),   // 初始化队列统计 map
 		latencyStats:    make(map[string]*LatencyStats), // 初始化延迟统计 map
+		respLatency:     make(map[string]*LatencyStats), // 初始化响应式延迟统计 map
 		slowThreshold:   time.Second,                    // 设置默认的慢消费阈值
 	}
 }
@@ -117,13 +122,14 @@ func (m *MetricsTracer) OnUnsubscribe(topic string, handler any) {
 
 // OnError 在发生错误时调用
 func (m *MetricsTracer) OnError(topic string, err error) {
-	if errors.Is(err, ErrNoSubscriber) {
-		m.errorCount.Add(1)
-		m.messageCount.Add(1)
-	}
+	m.errorCount.Add(1)
+	// ErrNoSubscriber 仍然算一条错误，但消息数已在 OnPublish 计入，无需重复加一
 }
 
-// OnComplete 在消息处理完成时调用
+// OnComplete 在消息处理完成时调用。
+//
+// 处理耗时以纳秒累加；小于 1ms 的样本会被记为 1ms 下限，避免极快处理在累加中
+// 失真。代价是高频小消息的平均处理时间会偏高，若需精确计时请在处理器内部自行埋点。
 func (m *MetricsTracer) OnComplete(topic string, metadata CompleteMetadata) {
 	if metadata.ProcessingTime < time.Millisecond {
 		metadata.ProcessingTime = time.Millisecond
@@ -155,11 +161,14 @@ func (m *MetricsTracer) OnQueueFull(topic string, size int) {
 		}
 	}
 
-	// 更新平均值统计
-	sampleCount := stats.sampleCount.Add(1)
-	currentTotal := stats.avgSize.Load() * (sampleCount - 1)
-	newAvg := (currentTotal + int64(size)) / sampleCount
-	stats.avgSize.Store(newAvg)
+	// 使用无锁 EMA 更新平均队列大小，α = 0.1
+	for {
+		oldAvg := stats.avgSize.Load()
+		newAvg := int64(float64(oldAvg)*0.9 + float64(size)*0.1)
+		if stats.avgSize.CompareAndSwap(oldAvg, newAvg) {
+			break
+		}
+	}
 }
 
 // OnSlowConsumer 在慢消费者时调用
@@ -189,9 +198,34 @@ func (m *MetricsTracer) OnSlowConsumer(topic string, latency time.Duration) {
 	}
 }
 
+// OnSlowConsumerResponse 记录响应式处理路径的慢消费
+func (m *MetricsTracer) OnSlowConsumerResponse(topic string, latency time.Duration) {
+	m.mu.Lock()
+	stats, ok := m.respLatency[topic]
+	if !ok {
+		stats = &LatencyStats{}
+		m.respLatency[topic] = stats
+	}
+	m.mu.Unlock()
+
+	stats.slowCount.Add(1)
+	stats.sampleCount.Add(1)
+	stats.totalLatency.Add(latency.Nanoseconds())
+
+	for {
+		current := stats.maxLatency.Load()
+		if latency.Nanoseconds() <= current {
+			break
+		}
+		if stats.maxLatency.CompareAndSwap(current, latency.Nanoseconds()) {
+			break
+		}
+	}
+}
+
 // GetMetrics 获取当前指标
-func (m *MetricsTracer) GetMetrics() map[string]interface{} {
-	metrics := map[string]interface{}{
+func (m *MetricsTracer) GetMetrics() map[string]any {
+	metrics := map[string]any{
 		"message_count":   m.messageCount.Load(),
 		"error_count":     m.errorCount.Load(),
 		"processing_time": time.Duration(m.processingTime.Load()),
@@ -215,33 +249,39 @@ func (m *MetricsTracer) GetQueueMetrics() map[string]map[string]int64 {
 	metrics := make(map[string]map[string]int64, len(m.queueStats))
 	for topic, stats := range m.queueStats {
 		metrics[topic] = map[string]int64{
-			"max_size":     stats.maxSize.Load(),
-			"full_count":   stats.fullCount.Load(),
-			"avg_size":     stats.avgSize.Load(),
-			"sample_count": stats.sampleCount.Load(),
+			"max_size":   stats.maxSize.Load(),
+			"full_count": stats.fullCount.Load(),
+			"avg_size":   stats.avgSize.Load(),
 		}
 	}
 	return metrics
 }
 
 // GetLatencyMetrics 获取延迟指标
-func (m *MetricsTracer) GetLatencyMetrics() map[string]map[string]interface{} {
+func (m *MetricsTracer) GetLatencyMetrics() map[string]map[string]map[string]any {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	metrics := make(map[string]map[string]interface{}, len(m.latencyStats))
-	for topic, stats := range m.latencyStats {
-		sampleCount := stats.sampleCount.Load()
-		if sampleCount == 0 {
-			continue
-		}
 
-		avgLatency := time.Duration(stats.totalLatency.Load() / sampleCount)
-		metrics[topic] = map[string]interface{}{
-			"max_latency":  time.Duration(stats.maxLatency.Load()),
-			"avg_latency":  avgLatency,
-			"slow_count":   stats.slowCount.Load(),
-			"sample_count": sampleCount,
+	build := func(src map[string]*LatencyStats) map[string]map[string]any {
+		res := make(map[string]map[string]any, len(src))
+		for topic, stats := range src {
+			sampleCount := stats.sampleCount.Load()
+			if sampleCount == 0 {
+				continue
+			}
+			avgLatency := time.Duration(stats.totalLatency.Load() / sampleCount)
+			res[topic] = map[string]any{
+				"max_latency":  time.Duration(stats.maxLatency.Load()),
+				"avg_latency":  avgLatency,
+				"slow_count":   stats.slowCount.Load(),
+				"sample_count": sampleCount,
+			}
 		}
+		return res
 	}
-	return metrics
+
+	return map[string]map[string]map[string]any{
+		"normal":   build(m.latencyStats),
+		"response": build(m.respLatency),
+	}
 }

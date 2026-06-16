@@ -3,6 +3,7 @@ package eventbus
 import (
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,11 +17,11 @@ func Test_newCowMap(t *testing.T) {
 
 func Test_CowMapLoad(t *testing.T) {
 	m := newCowMap()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, strconv.Itoa(i))
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		val, ok := m.Load(i)
 		assert.True(t, ok)
 		assert.Equal(t, strconv.Itoa(i), val.(string))
@@ -33,24 +34,24 @@ func Test_CowMapLoad(t *testing.T) {
 
 func Test_CowMapStore(t *testing.T) {
 	m := newCowMap()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, strconv.Itoa(i))
 	}
 
-	assert.Equal(t, uint32(100), m.Len())
+	assert.Equal(t, 100, m.Len())
 }
 
 func Test_CowMapDelete(t *testing.T) {
 	m := newCowMap()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, strconv.Itoa(i))
 	}
 
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		m.Delete(i)
 	}
 
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		val, ok := m.Load(i)
 		assert.False(t, ok)
 		assert.Equal(t, nil, val)
@@ -65,12 +66,12 @@ func Test_CowMapDelete(t *testing.T) {
 
 func Test_CowMapClear(t *testing.T) {
 	m := newCowMap()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, strconv.Itoa(i))
 	}
 
 	m.Clear()
-	assert.Equal(t, uint32(0), m.Len())
+	assert.Equal(t, 0, m.Len())
 }
 
 func Test_CowMapStoreUncomparable(t *testing.T) {
@@ -92,22 +93,22 @@ func Test_CowMapStoreUncomparable(t *testing.T) {
 		m.Store("map", mapValue)
 	})
 
-	assert.Equal(t, uint32(2), m.Len())
+	assert.Equal(t, 2, m.Len())
 }
 
 func Test_CowMapLen(t *testing.T) {
 	m := newCowMap()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, strconv.Itoa(i))
 	}
-	assert.Equal(t, uint32(100), m.Len())
+	assert.Equal(t, 100, m.Len())
 }
 
 func Test_CowMapRange(t *testing.T) {
 	m := newCowMap()
 	expert := make([]bool, 100)
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, strconv.Itoa(i))
 	}
 	m.Range(func(key any, value any) bool {
@@ -126,7 +127,7 @@ func Test_CowMapRangeStop(t *testing.T) {
 	m := newCowMap()
 	results := make([]bool, 100)
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, strconv.Itoa(i))
 	}
 
@@ -156,9 +157,9 @@ func Test_CowMapRangeStop(t *testing.T) {
 func Test_CowMapConcurrentLoadPanic(t *testing.T) {
 	m := newCowMap()
 	assert.NotPanics(t, func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			go func() {
-				for j := 0; j < 100; j++ {
+				for j := range 100 {
 					m.Store(j, strconv.Itoa(j))
 				}
 			}()
@@ -168,14 +169,14 @@ func Test_CowMapConcurrentLoadPanic(t *testing.T) {
 
 func Test_CowMapConcurrentStorePanic(t *testing.T) {
 	m := newCowMap()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, strconv.Itoa(i))
 	}
 
 	assert.NotPanics(t, func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			go func() {
-				for j := 0; j < 100; j++ {
+				for j := range 100 {
 					m.Load(j)
 				}
 			}()
@@ -185,14 +186,14 @@ func Test_CowMapConcurrentStorePanic(t *testing.T) {
 
 func Test_CowMapStoreOrLoadConcurrent(t *testing.T) {
 	m := newCowMap()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, i)
 	}
 
 	storewg := sync.WaitGroup{}
 	storewg.Add(100)
 	assert.NotPanics(t, func() {
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			go func(index int) {
 				for j := index * 100; j < (index+1)*100; j++ {
 					m.Store(j, j)
@@ -206,7 +207,7 @@ func Test_CowMapStoreOrLoadConcurrent(t *testing.T) {
 	loadwg := sync.WaitGroup{}
 	loadwg.Add(100)
 	assert.NotPanics(t, func() {
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			go func(index int) {
 				for j := index * 100; j < (index+1)*100; j++ {
 					val, ok := m.Load(j)
@@ -222,7 +223,7 @@ func Test_CowMapStoreOrLoadConcurrent(t *testing.T) {
 
 func Test_CowMapStoreAndLoadConcurrent(t *testing.T) {
 	m := newCowMap()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m.Store(i, i)
 	}
 
@@ -231,9 +232,9 @@ func Test_CowMapStoreAndLoadConcurrent(t *testing.T) {
 		loadWg := sync.WaitGroup{}
 		loadWg.Add(loadGoroutineSize)
 
-		for i := 0; i < loadGoroutineSize; i++ {
+		for range loadGoroutineSize {
 			go func() {
-				for j := 0; j < 100; j++ {
+				for j := range 100 {
 					val, ok := m.Load(j)
 					assert.True(t, ok)
 					assert.Equal(t, j, val)
@@ -245,9 +246,9 @@ func Test_CowMapStoreAndLoadConcurrent(t *testing.T) {
 		storeGoroutineSize := 100
 		storeWg := sync.WaitGroup{}
 		storeWg.Add(storeGoroutineSize)
-		for i := 0; i < storeGoroutineSize; i++ {
+		for i := range storeGoroutineSize {
 			go func(index int) {
-				for j := 0; j < 100; j++ {
+				for j := range 100 {
 					m.Store(j, j)
 				}
 				storeWg.Done()
@@ -257,4 +258,70 @@ func Test_CowMapStoreAndLoadConcurrent(t *testing.T) {
 		storeWg.Wait()
 		loadWg.Wait()
 	})
+}
+
+func Test_CowMapLoadOrStoreConcurrentSingleCreation(t *testing.T) {
+	m := newCowMap()
+
+	const goroutines = 200
+	start := make(chan struct{})
+	var created int64
+	var first any
+
+	results := make(chan any, goroutines)
+	flags := make(chan bool, goroutines)
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := range goroutines {
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			actual, loaded := m.LoadOrStore("only", id)
+			flags <- loaded
+			results <- actual
+			if !loaded {
+				atomic.AddInt64(&created, 1)
+				first = actual
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+	close(flags)
+
+	assert.Equal(t, int64(1), created)
+
+	final, ok := m.Load("only")
+	assert.True(t, ok)
+	assert.Equal(t, first, final)
+	assert.Equal(t, 1, m.Len())
+
+	for v := range results {
+		assert.Equal(t, first, v)
+	}
+
+	loadedCount := 0
+	for f := range flags {
+		if f {
+			loadedCount++
+		}
+	}
+	assert.Equal(t, goroutines-1, loadedCount)
+}
+
+func Test_CowMapLoadOrStoreExistingValue(t *testing.T) {
+	m := newCowMap()
+	m.Store("key", "value1")
+
+	actual, loaded := m.LoadOrStore("key", "value2")
+	assert.True(t, loaded)
+	assert.Equal(t, "value1", actual)
+	assert.Equal(t, 1, m.Len())
+
+	val, ok := m.Load("key")
+	assert.True(t, ok)
+	assert.Equal(t, "value1", val)
 }

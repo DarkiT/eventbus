@@ -5,18 +5,70 @@ import (
 	"strings"
 )
 
-// TopicSeparators 定义允许的主题分隔符
+// TopicSeparators 定义允许的主题分隔符，normalizeTopic 在规范化主题时读取。
+//
+// 注意：该变量为包级可变状态，仅应在 init 阶段或首次使用前设置；运行期并发修改
+// 会与 normalizeTopic 的读取发生 data race。如需自定义分隔符，请在初始化时确定。
 var TopicSeparators = []string{".", "/"}
 
 // normalizeTopic 将主题中的所有分隔符统一为标准分隔符
-func normalizeTopic(topic string) string {
+// 处理边界情况：连续分隔符、前后分隔符、空白字符
+func normalizeTopic(topic string) (string, error) {
+	// 去除前后空白
+	topic = strings.TrimSpace(topic)
+	if topic == "" {
+		return "", ErrInvalidTopic
+	}
+
+	// 统一分隔符
 	result := topic
 	for _, sep := range TopicSeparators {
 		if sep != "." {
 			result = strings.ReplaceAll(result, sep, ".")
 		}
 	}
-	return result
+
+	// 去除前后分隔符
+	result = strings.Trim(result, ".")
+
+	// 合并连续分隔符
+	for strings.Contains(result, "..") {
+		result = strings.ReplaceAll(result, "..", ".")
+	}
+
+	// 验证结果
+	if result == "" {
+		return "", ErrInvalidTopic
+	}
+
+	if err := validateTopicPattern(result); err != nil {
+		return "", err
+	}
+
+	return result, nil
+}
+
+// validateTopicPattern 校验主题 / 模式中通配符的位置是否合法。
+// 规则：
+// - `+` / `*` 可作为任意单层级通配符，但必须独占一个层级。
+// - `#` 只能独占最后一个层级。
+func validateTopicPattern(topic string) error {
+	parts := strings.Split(topic, ".")
+	for idx, part := range parts {
+		switch part {
+		case "+", "*":
+			continue
+		case "#":
+			if idx != len(parts)-1 {
+				return ErrInvalidTopic
+			}
+		default:
+			if strings.ContainsAny(part, "+#*") {
+				return ErrInvalidTopic
+			}
+		}
+	}
+	return nil
 }
 
 // TopicGroup 表示一个主题组
@@ -26,7 +78,7 @@ type TopicGroup struct {
 }
 
 // buildTopic 构建带前缀的标准主题
-func (g *TopicGroup) buildTopic(topic string) string {
+func (g *TopicGroup) buildTopic(topic string) (string, error) {
 	switch {
 	case g == nil:
 		return normalizeTopic(topic)
@@ -49,137 +101,196 @@ func (e *EventBus) NewGroup(prefix string) *TopicGroup {
 
 // Publish 在组内发布消息
 func (g *TopicGroup) Publish(topic string, payload any) error {
-	return g.bus.Publish(g.buildTopic(topic), payload)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.Publish(built, payload)
 }
 
 // Subscribe 订阅组内的主题
 func (g *TopicGroup) Subscribe(topic string, handler any) error {
-	return g.bus.Subscribe(g.buildTopic(topic), handler)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.Subscribe(built, handler)
 }
 
 // Unsubscribe 取消订阅组内的主题
 func (g *TopicGroup) Unsubscribe(topic string, handler any) error {
-	return g.bus.Unsubscribe(g.buildTopic(topic), handler)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.Unsubscribe(built, handler)
 }
 
 // UnsubscribeAll 取消组内主题的所有订阅
 func (g *TopicGroup) UnsubscribeAll(topic string) error {
-	return g.bus.UnsubscribeAll(g.buildTopic(topic))
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.UnsubscribeAll(built)
 }
 
 // PublishSync 在组内同步发布消息
 func (g *TopicGroup) PublishSync(topic string, payload any) error {
-	return g.bus.PublishSync(g.buildTopic(topic), payload)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.PublishSync(built, payload)
 }
 
 // PublishWithContext 在组内带上下文异步发布
 func (g *TopicGroup) PublishWithContext(ctx context.Context, topic string, payload any) error {
-	return g.bus.PublishWithContext(ctx, g.buildTopic(topic), payload)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.PublishWithContext(ctx, built, payload)
 }
 
 // PublishSyncWithContext 在组内带上下文同步发布
 func (g *TopicGroup) PublishSyncWithContext(ctx context.Context, topic string, payload any) error {
-	return g.bus.PublishSyncWithContext(ctx, g.buildTopic(topic), payload)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.PublishSyncWithContext(ctx, built, payload)
 }
 
 // PublishSyncAll 组内响应式同步发布（全部成功）
 func (g *TopicGroup) PublishSyncAll(topic string, payload any) (*SyncResult, error) {
-	return g.bus.PublishSyncAll(g.buildTopic(topic), payload)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return nil, err
+	}
+	return g.bus.PublishSyncAll(built, payload)
 }
 
 // PublishSyncAllWithContext 组内响应式同步发布（全部成功，透传上下文）
 func (g *TopicGroup) PublishSyncAllWithContext(ctx context.Context, topic string, payload any) (*SyncResult, error) {
-	return g.bus.PublishSyncAllWithContext(ctx, g.buildTopic(topic), payload)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return nil, err
+	}
+	return g.bus.PublishSyncAllWithContext(ctx, built, payload)
 }
 
 // PublishSyncAny 组内响应式同步发布（任一成功）
 func (g *TopicGroup) PublishSyncAny(topic string, payload any) (*SyncResult, error) {
-	return g.bus.PublishSyncAny(g.buildTopic(topic), payload)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return nil, err
+	}
+	return g.bus.PublishSyncAny(built, payload)
 }
 
 // PublishSyncAnyWithContext 组内响应式同步发布（任一成功，透传上下文）
 func (g *TopicGroup) PublishSyncAnyWithContext(ctx context.Context, topic string, payload any) (*SyncResult, error) {
-	return g.bus.PublishSyncAnyWithContext(ctx, g.buildTopic(topic), payload)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return nil, err
+	}
+	return g.bus.PublishSyncAnyWithContext(ctx, built, payload)
+}
+
+// PublishSyncAnyValue 组内快速返回首个成功处理器的结果。
+func (g *TopicGroup) PublishSyncAnyValue(topic string, payload any) (any, error) {
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return nil, err
+	}
+	return g.bus.PublishSyncAnyValue(built, payload)
+}
+
+// PublishSyncAnyValueWithContext 组内快速返回首个成功处理器的结果，支持上下文。
+func (g *TopicGroup) PublishSyncAnyValueWithContext(ctx context.Context, topic string, payload any) (any, error) {
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return nil, err
+	}
+	return g.bus.PublishSyncAnyValueWithContext(ctx, built, payload)
 }
 
 // SubscribeWithPriority 组内带优先级订阅
 func (g *TopicGroup) SubscribeWithPriority(topic string, handler any, priority int) error {
-	return g.bus.SubscribeWithPriority(g.buildTopic(topic), handler, priority)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.SubscribeWithPriority(built, handler, priority)
 }
 
 // SubscribeWithResponse 组内响应式订阅
 func (g *TopicGroup) SubscribeWithResponse(topic string, handler ResponseHandler) error {
-	return g.bus.SubscribeWithResponse(g.buildTopic(topic), handler)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.SubscribeWithResponse(built, handler)
 }
 
 // SubscribeWithResponseContext 组内带上下文的响应式订阅
 func (g *TopicGroup) SubscribeWithResponseContext(topic string, handler ResponseHandlerWithContext) error {
-	return g.bus.SubscribeWithResponseContext(g.buildTopic(topic), handler)
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
+	}
+	return g.bus.SubscribeWithResponseContext(built, handler)
 }
 
-// matchTopic 检查主题是否匹配MQTT通配符模式
-// 支持三种通配符：
-// * - 匹配末尾的单层级 (如 xxx/xxx/*)
-// + - 匹配中间的单层级 (如 xxx/+/xxx)
-// # - 匹配多层级路径 (如 xxx/# 匹配 xxx/xxx、xxx/xxx/xxx)
-func matchTopic(pattern, topic string) bool {
-	// 统一分隔符
-	pattern = normalizeTopic(pattern)
-	topic = normalizeTopic(topic)
-
-	// 处理完全通配符
-	if pattern == "#" {
-		return true
+// SubscribeWithFilter 组内带过滤器订阅
+func (g *TopicGroup) SubscribeWithFilter(topic string, handler any, filter EventFilter) error {
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return err
 	}
+	return g.bus.SubscribeWithFilter(built, handler, filter)
+}
 
-	// 将模式和主题分割成部分
-	patternParts := strings.Split(pattern, ".")
-	topicParts := strings.Split(topic, ".")
-
-	// 检查是否以 # 结尾（多层通配符）
-	if len(patternParts) > 0 && patternParts[len(patternParts)-1] == "#" {
-		// 移除 # 并检查前缀是否匹配
-		prefixParts := patternParts[:len(patternParts)-1]
-		if len(topicParts) < len(prefixParts) {
-			return false
-		}
-		// 只需要匹配前缀部分
-		return matchParts(prefixParts, topicParts[:len(prefixParts)])
+// NewSubGroup 创建嵌套子组
+// 子组的前缀为父组前缀 + 子前缀
+func (g *TopicGroup) NewSubGroup(prefix string) *TopicGroup {
+	if g == nil {
+		return nil
 	}
-
-	// 检查是否以 * 结尾（末尾单层通配符）
-	if len(patternParts) > 0 && patternParts[len(patternParts)-1] == "*" {
-		// 长度必须相等
-		if len(patternParts) != len(topicParts) {
-			return false
-		}
-		// 匹配除最后一层外的所有部分
-		prefixParts := patternParts[:len(patternParts)-1]
-		return matchParts(prefixParts, topicParts[:len(prefixParts)])
+	newPrefix, err := g.buildTopic(prefix)
+	if err != nil {
+		// 如果前缀无效，使用原始前缀
+		newPrefix = g.prefix
 	}
+	return &TopicGroup{
+		prefix: newPrefix,
+		bus:    g.bus,
+	}
+}
 
-	// 普通匹配（包括 + 通配符）
-	if len(patternParts) != len(topicParts) {
+// Prefix 返回当前组的前缀
+func (g *TopicGroup) Prefix() string {
+	if g == nil {
+		return ""
+	}
+	return g.prefix
+}
+
+// GetSubscriberCount 返回组内指定主题的订阅者数量
+func (g *TopicGroup) GetSubscriberCount(topic string) (int, error) {
+	built, err := g.buildTopic(topic)
+	if err != nil {
+		return 0, err
+	}
+	return g.bus.GetSubscriberCount(built)
+}
+
+// HasSubscribers 检查组内指定主题是否有订阅者
+func (g *TopicGroup) HasSubscribers(topic string) bool {
+	built, err := g.buildTopic(topic)
+	if err != nil {
 		return false
 	}
-
-	return matchParts(patternParts, topicParts)
-}
-
-// matchParts 匹配模式部分和主题部分
-// 支持 + 通配符匹配单个层级
-func matchParts(patternParts, topicParts []string) bool {
-	for i := range len(patternParts) {
-		if i >= len(topicParts) {
-			return false
-		}
-		// + 和 * 都可以匹配单个层级
-		if patternParts[i] == "+" || patternParts[i] == "*" {
-			continue
-		}
-		if patternParts[i] != topicParts[i] {
-			return false
-		}
-	}
-	return true
+	return g.bus.HasSubscribers(built)
 }

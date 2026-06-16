@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 // DefaultBus 全局默认事件总线实例
@@ -11,17 +12,31 @@ var DefaultBus = New(defaultBufferSize)
 
 // singleton 全局单例实例（内部使用）
 var (
-	singleton *EventBus
-	once      sync.Once
-	mu        sync.RWMutex
+	singletonVal atomic.Value
+	initialized  atomic.Bool // 替代 sync.Once，支持安全重置
+	mu           sync.RWMutex
 )
 
 // getSingleton 获取单例实例，使用懒加载
 func getSingleton() *EventBus {
-	once.Do(func() {
-		singleton = DefaultBus
-	})
-	return singleton
+	if bus := loadSingleton(); bus != nil {
+		return bus
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// 二次检查，避免重复创建
+	if bus := loadSingleton(); bus != nil {
+		return bus
+	}
+
+	// 使用 atomic.Bool 控制初始化，支持安全重置
+	if initialized.CompareAndSwap(false, true) {
+		storeSingleton(DefaultBus)
+	}
+
+	return loadSingleton()
 }
 
 // ResetSingleton 重置单例对象，主要用于测试
@@ -29,13 +44,12 @@ func ResetSingleton() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if singleton != nil {
-		singleton.Close()
+	if bus := loadSingleton(); bus != nil {
+		bus.Close()
 	}
 
-	// 重置 once，允许重新创建
-	once = sync.Once{}
-	singleton = nil
+	storeSingleton((*EventBus)(nil))
+	initialized.Store(false) // 原子重置，支持重新创建
 
 	// 重新创建 DefaultBus 实例，确保测试隔离
 	DefaultBus = New(defaultBufferSize)
@@ -51,6 +65,16 @@ func SubscribeWithPriority(topic string, handler any, priority int) error {
 	return getSingleton().SubscribeWithPriority(topic, handler, priority)
 }
 
+// SubscribeOnce 一次性订阅，使用全局单例
+func SubscribeOnce(topic string, handler any) error {
+	return getSingleton().SubscribeOnce(topic, handler)
+}
+
+// SubscribeOnceWithPriority 带优先级一次性订阅，使用全局单例
+func SubscribeOnceWithPriority(topic string, handler any, priority int) error {
+	return getSingleton().SubscribeOnceWithPriority(topic, handler, priority)
+}
+
 // SubscribeWithResponse 响应式订阅，使用全局单例
 func SubscribeWithResponse(topic string, handler ResponseHandler) error {
 	return getSingleton().SubscribeWithResponse(topic, handler)
@@ -59,6 +83,11 @@ func SubscribeWithResponse(topic string, handler ResponseHandler) error {
 // SubscribeWithResponseContext 带上下文的响应式订阅，使用全局单例
 func SubscribeWithResponseContext(topic string, handler ResponseHandlerWithContext) error {
 	return getSingleton().SubscribeWithResponseContext(topic, handler)
+}
+
+// SubscribeReliable 可靠订阅，使用全局单例。
+func SubscribeReliable(topic string, handler ReliableHandler, opts ...RetryOption) error {
+	return getSingleton().SubscribeReliable(topic, handler, opts...)
 }
 
 // Unsubscribe 取消订阅主题，使用全局单例
@@ -101,6 +130,16 @@ func PublishSyncAnyWithContext(ctx context.Context, topic string, payload any) (
 	return getSingleton().PublishSyncAnyWithContext(ctx, topic, payload)
 }
 
+// PublishSyncAnyValue 快速返回首个成功处理器的结果，使用全局单例。
+func PublishSyncAnyValue(topic string, payload any) (any, error) {
+	return getSingleton().PublishSyncAnyValue(topic, payload)
+}
+
+// PublishSyncAnyValueWithContext 快速返回首个成功处理器的结果，透传上下文。
+func PublishSyncAnyValueWithContext(ctx context.Context, topic string, payload any) (any, error) {
+	return getSingleton().PublishSyncAnyValueWithContext(ctx, topic, payload)
+}
+
 // PublishWithContext 带上下文发布消息，使用全局单例
 func PublishWithContext(ctx context.Context, topic string, payload any) error {
 	return getSingleton().PublishWithContext(ctx, topic, payload)
@@ -132,7 +171,7 @@ func Use(middleware IMiddleware) {
 }
 
 // GetStats 获取统计信息，使用全局单例
-func GetStats() map[string]interface{} {
+func GetStats() map[string]any {
 	return getSingleton().GetStats()
 }
 
@@ -141,19 +180,61 @@ func NewGroup(prefix string) *TopicGroup {
 	return getSingleton().NewGroup(prefix)
 }
 
-// Close 关闭全局单例
+// Close 关闭全局单例。
+//
+// Close 为永久关闭语义：关闭后底层单例处于已关闭状态，包级函数会持续返回
+// ErrEventBusClosed。getSingleton 在单例为空时回落到 DefaultBus，而 Close 不重建
+// DefaultBus，因此关闭后单例不可用。如需恢复为全新可用实例，请使用 ResetSingleton
+// （它会重建 DefaultBus）。该行为由 Test_SingletonUnsubscribe 等契约锁定。
 func Close() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if singleton != nil {
-		singleton.Close()
-		singleton = nil
-		once = sync.Once{} // 重置 once，允许重新创建
+	if bus := loadSingleton(); bus != nil {
+		bus.Close()
 	}
+	storeSingleton((*EventBus)(nil))
+	initialized.Store(false) // 重置标志；DefaultBus 仍为已关闭实例，恢复需 ResetSingleton
+}
+
+// Shutdown 优雅关闭全局单例。
+//
+// Shutdown 会关闭当前 DefaultBus/单例并进入永久关闭语义；如需测试或重建可用实例，
+// 调用 ResetSingleton。
+func Shutdown(ctx context.Context) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	bus := loadSingleton()
+	if bus == nil && initialized.CompareAndSwap(false, true) {
+		storeSingleton(DefaultBus)
+		bus = DefaultBus
+	}
+	if bus == nil {
+		return nil
+	}
+	err := bus.Shutdown(ctx)
+	storeSingleton((*EventBus)(nil))
+	initialized.Store(false)
+	return err
 }
 
 // HealthCheck 健康检查，使用全局单例
 func HealthCheck() error {
 	return getSingleton().HealthCheck()
+}
+
+// loadSingleton 统一从 atomic.Value 读取并做类型断言
+func loadSingleton() *EventBus {
+	v := singletonVal.Load()
+	if v == nil {
+		return nil
+	}
+	bus, _ := v.(*EventBus)
+	return bus
+}
+
+// storeSingleton 封装 atomic.Value.Store，便于统一管理
+func storeSingleton(bus *EventBus) {
+	singletonVal.Store(bus)
 }
